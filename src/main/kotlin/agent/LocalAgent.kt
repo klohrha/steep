@@ -39,6 +39,7 @@ import model.timeout.TimeoutPolicy
 import org.slf4j.LoggerFactory
 import org.slf4j.MDC
 import runtime.DockerRuntime
+import runtime.KubernetesRuntime
 import runtime.OtherRuntime
 import java.io.File
 import java.util.concurrent.ExecutorService
@@ -112,6 +113,7 @@ class LocalAgent(private val vertx: Vertx, val dispatcher: CoroutineDispatcher,
 
   private val otherRuntime by lazy { OtherRuntime() }
   private val dockerRuntime by lazy { DockerRuntime(config) }
+  private val kubernetesRuntime by lazy { KubernetesRuntime(config) }
 
   override suspend fun execute(processChain: ProcessChain): Map<String, List<Any>> {
     val outputs = processChain.executables
@@ -243,7 +245,13 @@ class LocalAgent(private val vertx: Vertx, val dispatcher: CoroutineDispatcher,
         }
       }
 
-      if (exec.runtime == Service.RUNTIME_DOCKER) {
+      if (exec.runtime == Service.RUNTIME_KUBERNETES) {
+        interruptable(executor) {
+          withMDC(exec, processChainId) {
+            kubernetesRuntime.execute(exec, collector)
+          }
+        }
+      } else if (exec.runtime == Service.RUNTIME_DOCKER) {
         interruptable(executor) {
           withMDC(exec, processChainId) {
             dockerRuntime.execute(exec, collector)
@@ -363,15 +371,16 @@ class LocalAgent(private val vertx: Vertx, val dispatcher: CoroutineDispatcher,
 
     return so.chunked(100).map { w ->
       Executable(
-        path = "mkdir",
+        path = "cmd",
         serviceId = "mkdir",
         arguments = listOf(
             Argument(
-                label = "-p",
-                variable = ArgumentVariable(UniqueID.next(), "true"),
+                label = "/c",
+                variable = ArgumentVariable(UniqueID.next(), "mkdir"),
                 type = Argument.Type.INPUT,
-                dataType = Argument.DATA_TYPE_BOOLEAN
-            )
+                dataType = Argument.DATA_TYPE_STRING
+            ),
+
         ) + w.map { o ->
           Argument(
               variable = ArgumentVariable(UniqueID.next(), o),

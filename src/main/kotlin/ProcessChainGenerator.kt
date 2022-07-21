@@ -510,7 +510,7 @@ class ProcessChainGenerator(workflow: Workflow, private val tmpPath: String,
     } else {
       "$base/"
     }
-    return FilenameUtils.normalize(p + idGenerator.next() + (serviceParam.fileSuffix ?: ""))
+    return FilenameUtils.normalize(p + idGenerator.next() + (serviceParam.fileSuffix ?: ""), true)
   }
 
   /**
