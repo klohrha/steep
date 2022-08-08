@@ -23,9 +23,13 @@ val slf4jVersion by extra("1.7.32")
 val logbackVersion by extra("1.2.10")
 val junitVersion by extra("5.8.2")
 val testcontainersVersion by extra("1.16.3")
+val kubernetes_dsl_version by extra("3.2.0")
+val kubernetes_client_version by extra("6.0.0")
 
 repositories {
     mavenCentral()
+    // kubernetes kotlin library
+    maven ("https://jitpack.io")
 }
 
 dependencies {
@@ -92,6 +96,10 @@ dependencies {
     testImplementation("org.testcontainers:testcontainers:$testcontainersVersion")
     testImplementation("org.testcontainers:junit-jupiter:$testcontainersVersion")
     testImplementation("org.testcontainers:postgresql:$testcontainersVersion")
+
+    //kubernetes kotlin library
+    implementation("com.github.fkorotkov:k8s-kotlin-dsl:$kubernetes_dsl_version")
+    implementation("io.fabric8:kubernetes-client:$kubernetes_client_version")
 }
 
 application {

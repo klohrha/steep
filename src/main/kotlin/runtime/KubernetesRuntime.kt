@@ -1,5 +1,6 @@
 package runtime
 
+import com.fkorotkov.kubernetes.*
 import helper.OutputCollector
 import helper.Shell
 import helper.UniqueID
@@ -8,6 +9,12 @@ import io.vertx.core.json.JsonObject
 import model.processchain.Argument
 import model.processchain.ArgumentVariable
 import model.processchain.Executable
+
+import com.fkorotkov.kubernetes.extensions.*
+import io.fabric8.kubernetes.api.model.IntOrString
+import io.fabric8.kubernetes.client.ConfigBuilder
+import io.fabric8.kubernetes.client.DefaultKubernetesClient
+import io.fabric8.kubernetes.client.KubernetesClientBuilder
 
 /**
  * Runs executables as Docker containers. Uses the executable's path as the
@@ -78,11 +85,73 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
         )
 
 
-        val args = executable.arguments.map { argument ->
+
+        var arguments = executable.arguments.map { argument ->
             Argument(id = UniqueID.next(),
-                label = "--" + argument.id, variable = argument.variable,
+                argument.id, variable = argument.variable,
                 type = Argument.Type.INPUT)
         }
+
+        val processedArgs = mutableListOf<String>()
+        for (arg in executable.arguments) {
+            processedArgs.add(arg.variable.value)
+        }
+
+        println(processedArgs)
+
+        val id = UniqueID.next()
+
+        val config = ConfigBuilder()
+            .withMasterUrl("127.0.0.1:8081")
+            .withNamespace("default")
+            .withTrustCerts(true)
+            .build()
+        val client = KubernetesClientBuilder()
+            .withConfig(config)
+            .build()
+
+        client.namespaces().resource(newNamespace {
+            metadata {
+                name = "default"
+            }
+        }).createOrReplace()
+
+        client.pods().resource(newPod {
+            metadata {
+                name = "test-pod-" + id
+                spec {
+                    volumes = listOf(
+                        newVolume {
+                            name = "task-pv-storage"
+                            persistentVolumeClaim = newPersistentVolumeClaimVolumeSource{
+                                claimName = "task-pv-claim"
+                            }
+                        }
+                    )
+                    containers = listOf(
+                        newContainer {
+                            name = "custom-container"
+                            image = executable.path
+                            args = processedArgs
+                            volumeMounts = listOf(
+                                newVolumeMount {
+                                    mountPath = "/C/Users/hanna/Documents/uni/22_sose/thesis/steep"
+                                    name = "task-pv-storage"
+                                }
+                            )
+                        }
+                    )
+                    imagePullSecrets = listOf(
+                         newLocalObjectReference {
+                            name = "regcred2"
+                        }
+                    )
+                }
+            }
+        }).createOrReplace()
+        //println("Pods:" + client.pods().inAnyNamespace().list().items.joinToString("\n") { it.metadata.name })
+        println("Arguments: " + client.pods().inNamespace("default").withField("metadata.name", "test-pod-" + id).list().items.joinToString("\n") {it. metadata.name })
+        println("Success")
 
         val applyExec = Executable(id = executable.id, path = "kubectl",
             serviceId = executable.serviceId, arguments = applyArgs + executable.arguments)
@@ -93,8 +162,8 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
         try {
             //super.execute(applyExec, outputCollector)
             //super.execute(logsExec, outputCollector)
-            println(executable.arguments)
-            super.execute(kubernetesExec, outputCollector)
+            //println(executable.arguments)
+            //super.execute(kubernetesExec, outputCollector)
         } catch (e: InterruptedException) {
             try {
                 Shell.execute(listOf("kubectl", "kill", containerName), outputCollector)
