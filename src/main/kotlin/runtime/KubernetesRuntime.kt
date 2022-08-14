@@ -94,6 +94,10 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
 
         val processedArgs = mutableListOf<String>()
         for (arg in executable.arguments) {
+            if (arg.label != null) {
+                processedArgs.add(arg.label)
+                println("label" + arg.label)
+            }
             processedArgs.add(arg.variable.value)
         }
 

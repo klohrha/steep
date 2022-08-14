@@ -101,6 +101,48 @@
       cardinality: 1..1
       dataType: file
 
+- id: anonymizer
+  name: anonymizer
+  description: Anonymizes images from a directory and saves them to a directory
+  path: "geocode.igd.fraunhofer.de:4567/hklohr/anonymizer"
+  runtime: docker
+  parameters:
+    - id: input_directory
+      name: Input directory
+      description: A directory containing images to convert
+      type: input
+      cardinality: 1..1
+      dataType: directory
+      label: -i
+    - id: output_directory
+      name: Output directory
+      description: An output directory
+      type: output
+      cardinality: 1..1
+      dataType: file
+      label: -o
+
+- id: anonymizer-kubernetes
+  name: anonymizer-kubernetes
+  description: Anonymizes images from a directory and saves them to a directory
+  path: "geocode.igd.fraunhofer.de:4567/hklohr/anonymizer"
+  runtime: kubernetes
+  parameters:
+    - id: input_directory
+      name: Input directory
+      description: A directory containing images to convert
+      type: input
+      cardinality: 1..1
+      dataType: directory
+      label: -i
+    - id: output_directory
+      name: Output directory
+      description: An output directory
+      type: output
+      cardinality: 1..1
+      dataType: file
+      label: -o
+
 - id: docker_sleep
   name: Docker sleep
   description: Run sleep inside an alpine container
