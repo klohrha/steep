@@ -12,9 +12,11 @@ import model.processchain.Executable
 
 import com.fkorotkov.kubernetes.extensions.*
 import io.fabric8.kubernetes.api.model.IntOrString
+import io.fabric8.kubernetes.api.model.PodList
 import io.fabric8.kubernetes.client.ConfigBuilder
 import io.fabric8.kubernetes.client.DefaultKubernetesClient
 import io.fabric8.kubernetes.client.KubernetesClientBuilder
+import java.util.concurrent.TimeUnit
 
 /**
  * Runs executables as Docker containers. Uses the executable's path as the
@@ -147,12 +149,17 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
                     )
                     imagePullSecrets = listOf(
                          newLocalObjectReference {
-                            name = "regcred2"
+                            name = "regcred"
                         }
                     )
                 }
             }
         }).createOrReplace()
+
+        var podList : PodList = client.pods().inNamespace("default").withField("metadata.name", "test-pod-" + id).list()
+
+        client.pods().inNamespace("default").withName(podList.items.get(0).metadata.name)
+           .waitUntilCondition({pod -> pod.getStatus().getPhase().equals("Running")}, 5, TimeUnit.MINUTES)
         //println("Pods:" + client.pods().inAnyNamespace().list().items.joinToString("\n") { it.metadata.name })
         println("Arguments: " + client.pods().inNamespace("default").withField("metadata.name", "test-pod-" + id).list().items.joinToString("\n") {it. metadata.name })
         println("Success")
