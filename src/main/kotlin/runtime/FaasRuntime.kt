@@ -21,12 +21,19 @@ import io.fabric8.kubernetes.client.dsl.FilterWatchListDeletable
 import io.fabric8.kubernetes.client.dsl.PodResource
 import java.util.concurrent.TimeUnit
 
+import io.ktor.application.*
+import io.ktor.http.*
+import io.ktor.response.*
+import io.ktor.routing.*
+import io.ktor.server.engine.*
+import io.ktor.server.netty.*
+
 /**
  * Runs executables as Docker containers. Uses the executable's path as the
  * Docker image name.
  * @author Michel Kraemer
  */
-class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
+class FaasRuntime(config: JsonObject) : OtherRuntime() {
     private val additionalDockerEnvironment: List<String> = config.getJsonArray(
         ConfigConstants.RUNTIMES_DOCKER_ENV, JsonArray()).map { it.toString() }
     private val additionalDockerVolumes: List<String> = config.getJsonArray(
@@ -78,6 +85,18 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
             .withConfig(config)
             .build()
 
+
+        // try out hello world
+        val target = System.getenv("TARGET") ?: "World"
+        val port = System.getenv("PORT") ?: "8080"
+        embeddedServer(Netty, port.toInt()) {
+            routing {
+                get("/") {
+                    call.respondText("Hello $target!\n", ContentType.Text.Html)
+                }
+            }
+        }.start(wait = true)
+
         try {
 
         client.namespaces().resource(newNamespace {
@@ -126,7 +145,6 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
 
         } catch (e: InterruptedException) {
             try {
-                //TODO
                 Shell.execute(listOf("kubectl", "kill", containerName), outputCollector)
                 Shell.execute(listOf("minikube", "stop"), outputCollector)
             } catch (t: Throwable) {

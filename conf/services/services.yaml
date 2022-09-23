@@ -51,9 +51,16 @@
 
 - id: kubernetes_hello_world
   name: Kubernetes hello world
-  description: Runs the hello-world Docker image
+  description: Runs the hello-world Docker image in a pod
   path: hello-world
   runtime: kubernetes
+  parameters: []
+
+- id: faas_hello_world
+  name: FaaS hello world
+  description: Runs a kotlin hello world inside a service
+  path: hello-world
+  runtime: faas
   parameters: []
 
 - id: kubernetes_testing
@@ -87,6 +94,25 @@
   description: Generates panorama tiles to a directory
   path: "geocode.igd.fraunhofer.de:4567/telekom/panorama-tiler:v3.4.2"
   runtime: kubernetes
+  parameters:
+    - id: input_directory
+      name: Input directory
+      description: A directory containing panoramas to convert
+      type: input
+      cardinality: 1..1
+      dataType: directory
+    - id: output_directory
+      name: Output directory
+      description: An output directory
+      type: output
+      cardinality: 1..1
+      dataType: file
+
+- id: panorama-tiler-faas
+  name: panorama-tiler-faas
+  description: Generates panorama tiles to a directory
+  path: "geocode.igd.fraunhofer.de:4567/telekom/panorama-tiler:v3.4.2"
+  runtime: faas
   parameters:
     - id: input_directory
       name: Input directory
