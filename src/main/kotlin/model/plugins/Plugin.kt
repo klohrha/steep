@@ -36,6 +36,11 @@ interface Plugin {
   val scriptFile: String
 
   /**
+   * The plugin's version
+   */
+  val version: String?
+
+  /**
    * The compiled plugin
    */
   val compiledFunction: KFunction<*>

@@ -1,22 +1,28 @@
 import classNames from "classnames"
-import { ChevronDown } from "react-feather"
+import { ChevronDown } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 import styles from "./DropDown.scss"
 
-const DropDown = ({ title, right, primary, children }) => {
+const DropDown = ({ title, right, primary, small, forceTitleVisible, children }) => {
   const [visible, setVisible] = useState(false)
   const ref = useRef()
   const btnRef = useRef()
 
-  function onDropDownClick(e) {
-    if (visible) {
-      setVisible(false)
-      btnRef.current.blur()
-    } else {
-      setVisible(true)
-      btnRef.current.focus()
-    }
-    e.stopPropagation()
+  function onDropDownClick() {
+    // Let the click propagate to the parent element first before we make
+    // the drop down menu visible. This makes sure other drop down menus on the
+    // page are closed. If we'd call setVisible without setTimeout here, our
+    // menu would never be displayed because the onDocumentClick handler above
+    // would just hide it again.
+    setTimeout(() => {
+      if (visible) {
+        setVisible(false)
+        btnRef.current.blur()
+      } else {
+        setVisible(true)
+        btnRef.current.focus()
+      }
+    }, 0)
   }
 
   useEffect(() => {
@@ -35,11 +41,11 @@ const DropDown = ({ title, right, primary, children }) => {
 
   return (
     <div className="dropdown" ref={ref}>
-      <button className={classNames("dropdown-btn", { primary })} ref={btnRef}
+      <button className={classNames("dropdown-btn", { primary, small })} ref={btnRef}
           onClick={onDropDownClick}>
-        <span className="dropdown-text">{title} </span><ChevronDown />
+        <span className={classNames("dropdown-text", { "force-visible": forceTitleVisible })}>{title} </span><ChevronDown />
        </button>
-      <div className={classNames("dropdown-menu", { visible, right })}>{children}</div>
+      <div className={classNames("dropdown-menu", { visible, right, "force-title-visible": forceTitleVisible })}>{children}</div>
       <style jsx>{styles}</style>
     </div>
   )

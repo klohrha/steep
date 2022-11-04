@@ -2,6 +2,7 @@ package model.plugins
 
 import Controller
 import Scheduler
+import com.fasterxml.jackson.annotation.JsonIgnore
 import io.vertx.core.Vertx
 import kotlin.reflect.KFunction
 import kotlin.reflect.full.callSuspend
@@ -19,11 +20,13 @@ import kotlin.reflect.full.callSuspend
 data class InitializerPlugin(
     override val name: String,
     override val scriptFile: String,
+    override val version: String? = null,
     override val dependsOn: List<String> = emptyList(),
 
     /**
      * The compiled plugin
      */
+    @JsonIgnore
     override val compiledFunction: KFunction<Unit> = throwPluginNeedsCompile()
 ) : DependentPlugin
 

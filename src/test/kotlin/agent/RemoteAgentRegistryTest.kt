@@ -2,8 +2,14 @@ package agent
 
 import AddressConstants.REMOTE_AGENT_ADDED
 import AddressConstants.REMOTE_AGENT_ADDRESS_PREFIX
+import agent.AgentRegistry.SelectCandidatesParam
 import coVerify
 import helper.UniqueID
+import helper.hazelcast.ClusterMap
+import helper.hazelcast.DummyClusterMap
+import io.mockk.every
+import io.mockk.mockkObject
+import io.mockk.unmockkAll
 import io.vertx.core.Vertx
 import io.vertx.core.eventbus.Message
 import io.vertx.core.impl.NoStackTraceThrowable
@@ -18,6 +24,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.assertj.core.api.Assertions.assertThat
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.extension.ExtendWith
 
@@ -31,6 +39,17 @@ class RemoteAgentRegistryTest {
    * A result of [registerAgentWithCapabilities]
    */
   private class RegisteredAgent(val address: String, var inquiryCount: Int = 0)
+
+  @BeforeEach
+  fun setUp() {
+    mockkObject(ClusterMap)
+    every { ClusterMap.create<Any, Any>(any(), any()) } answers { DummyClusterMap(arg(0), arg(1)) }
+  }
+
+  @AfterEach
+  fun tearDown() {
+    unmockkAll()
+  }
 
   /**
    * Registers a mock agent with the given [capabilities] in the given [registry].
@@ -53,10 +72,10 @@ class RemoteAgentRegistryTest {
           result.inquiryCount++
           val allRcs = JsonArray()
           val allCounts = mutableListOf<Long>()
-          json.getJsonArray("requiredCapabilities").forEach {
+          json.getJsonArray("params").forEach {
             val obj = it as JsonObject
-            allRcs.add(obj.getJsonArray("capabilities"))
-            allCounts.add(obj.getLong("processChainCount", 0L))
+            allRcs.add(obj.getJsonArray("requiredCapabilities"))
+            allCounts.add(obj.getLong("count", 0L))
           }
           val includeCapabilities = json.getBoolean("includeCapabilities", false)
           val best = bestSelector(allRcs, capabilities, allCounts)
@@ -99,7 +118,9 @@ class RemoteAgentRegistryTest {
   fun selectNoCandidate(vertx: Vertx, ctx: VertxTestContext) {
     val registry = RemoteAgentRegistry(vertx)
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = registry.selectCandidates(listOf(emptySet<String>() to 1))
+      val candidates = registry.selectCandidates(listOf(
+          SelectCandidatesParam(emptySet(), 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates).isEmpty()
       }
@@ -130,15 +151,14 @@ class RemoteAgentRegistryTest {
     val registry = RemoteAgentRegistry(vertx)
 
     val agentId = UniqueID.next()
-    val address = REMOTE_AGENT_ADDRESS_PREFIX + agentId
 
     var addedCount = 0
 
     vertx.eventBus().consumer<String>(REMOTE_AGENT_ADDED) { msg ->
-      if (msg.body() == address) {
+      if (msg.body() == agentId) {
         addedCount++
       } else {
-        ctx.failNow(NoStackTraceThrowable("Unknown agent address ${msg.body()}"))
+        ctx.failNow(NoStackTraceThrowable("Unknown agent id ${msg.body()}"))
       }
     }
 
@@ -167,7 +187,9 @@ class RemoteAgentRegistryTest {
         0
       }
 
-      val candidates = registry.selectCandidates(listOf(emptySet<String>() to 1))
+      val candidates = registry.selectCandidates(listOf(
+          SelectCandidatesParam(emptySet(), 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates).hasSize(1)
         assertThat(candidates[0]).isEqualTo(Pair(emptySet<String>(), agent.address))
@@ -248,7 +270,9 @@ class RemoteAgentRegistryTest {
         -1
       }
 
-      val candidates = registry.selectCandidates(listOf(reqCap to 1))
+      val candidates = registry.selectCandidates(listOf(
+          SelectCandidatesParam(reqCap, 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates).isEmpty()
         assertThat(agent.inquiryCount).isEqualTo(1)
@@ -278,7 +302,9 @@ class RemoteAgentRegistryTest {
       val agent2 = registerAgentWithCapabilities(reqCap2, registry, vertx,
           ctx, bestSelector = bestSelector)
 
-      val candidates1 = registry.selectCandidates(listOf(reqCap1 to 1))
+      val candidates1 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(reqCap1, 0, 0, 1)
+      ))
       var agent2InquiryCount1 = -1
       ctx.verify {
         assertThat(candidates1).hasSize(1)
@@ -290,7 +316,9 @@ class RemoteAgentRegistryTest {
         assertThat(agent2InquiryCount1).isBetween(0, 1)
       }
 
-      val candidates2 = registry.selectCandidates(listOf(reqCap2 to 1))
+      val candidates2 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(reqCap2, 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates2).hasSize(1)
         assertThat(candidates2[0]).isEqualTo(Pair(reqCap2, agent2.address))
@@ -326,8 +354,11 @@ class RemoteAgentRegistryTest {
       val agent3 = registerAgentWithCapabilities(reqCap3, registry, vertx,
           ctx, bestSelector = bestSelector)
 
-      val candidates = registry.selectCandidates(listOf(reqCap1 to 1,
-          reqCap2 to 1, reqCap3 to 1))
+      val candidates = registry.selectCandidates(listOf(
+          SelectCandidatesParam(reqCap1, 0, 0, 1),
+          SelectCandidatesParam(reqCap2, 0, 0, 1),
+          SelectCandidatesParam(reqCap3, 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates).containsExactlyInAnyOrder(Pair(reqCap1, agent1.address),
             Pair(reqCap2, agent2.address), Pair(reqCap3, agent3.address))
@@ -363,14 +394,18 @@ class RemoteAgentRegistryTest {
 
       // ask for capabilities that are not supported so the registry will
       // have to ask all agents and then know about all supported capabilities
-      val candidates0 = registry.selectCandidates(listOf(listOf("foobar") to 1))
+      val candidates0 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(listOf("foobar"), 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates0).isEmpty()
         assertThat(agent1.inquiryCount).isEqualTo(1)
         assertThat(agent2.inquiryCount).isEqualTo(1)
       }
 
-      val candidates1 = registry.selectCandidates(listOf(reqCap1 to 1))
+      val candidates1 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(reqCap1, 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates1).hasSize(1)
         assertThat(candidates1[0]).isEqualTo(Pair(reqCap1, agent1.address))
@@ -380,7 +415,9 @@ class RemoteAgentRegistryTest {
         assertThat(agent2.inquiryCount).isEqualTo(1)
       }
 
-      val candidates2 = registry.selectCandidates(listOf(reqCap2 to 1))
+      val candidates2 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(reqCap2, 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates2).hasSize(1)
         assertThat(candidates2[0]).isEqualTo(Pair(reqCap2, agent2.address))
@@ -408,14 +445,18 @@ class RemoteAgentRegistryTest {
       val agent2 = registerAgentWithCapabilities(reqCap2, registry, vertx,
           ctx, bestSelector = { _, _, _ -> -1 })
 
-      val candidates1 = registry.selectCandidates(listOf(listOf("foobar") to 1))
+      val candidates1 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(listOf("foobar"), 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates1).isEmpty()
         assertThat(agent1.inquiryCount).isEqualTo(1)
         assertThat(agent2.inquiryCount).isEqualTo(1)
       }
 
-      val candidates2 = registry.selectCandidates(listOf(listOf("foobar") to 1))
+      val candidates2 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(listOf("foobar"), 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates2).isEmpty()
         assertThat(agent1.inquiryCount).isEqualTo(1)
@@ -442,14 +483,18 @@ class RemoteAgentRegistryTest {
       val agent2 = registerAgentWithCapabilities(emptyList(), registry, vertx, ctx,
           sequenceProvider = q2::removeFirst, bestSelector = { _, _, _ -> 0 })
 
-      val candidates1 = registry.selectCandidates(listOf(emptyList<String>() to 1))
+      val candidates1 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(emptyList(), 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates1).hasSize(1)
         assertThat(candidates1[0]).isEqualTo(Pair(emptyList<String>(), agent1.address))
         assertThat(agent1.inquiryCount).isEqualTo(1)
         assertThat(agent2.inquiryCount).isEqualTo(1)
       }
-      val candidates2 = registry.selectCandidates(listOf(emptyList<String>() to 1))
+      val candidates2 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(emptyList(), 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates2).hasSize(1)
         assertThat(candidates2[0]).isEqualTo(Pair(emptyList<String>(), agent1.address))
@@ -458,7 +503,9 @@ class RemoteAgentRegistryTest {
         // has a lower sequence number
         assertThat(agent2.inquiryCount).isEqualTo(1)
       }
-      val candidates3 = registry.selectCandidates(listOf(emptyList<String>() to 1))
+      val candidates3 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(emptyList(), 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates3).hasSize(1)
         assertThat(candidates3[0]).isEqualTo(Pair(emptyList<String>(), agent2.address))
@@ -509,7 +556,9 @@ class RemoteAgentRegistryTest {
           agentId = "C", sequenceProvider = q3::removeFirst, bestSelector = bestSelector)
 
       // ask for capabilities that are not supported to initialize cache
-      val candidates0 = registry.selectCandidates(listOf(listOf("foobar") to 1))
+      val candidates0 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(listOf("foobar"), 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates0).isEmpty()
         assertThat(agent1.inquiryCount).isEqualTo(1)
@@ -517,7 +566,10 @@ class RemoteAgentRegistryTest {
         assertThat(agent3.inquiryCount).isEqualTo(1)
       }
 
-      val candidates1 = registry.selectCandidates(listOf(reqCap1 to 1, reqCap2 to 1))
+      val candidates1 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(reqCap1, 0, 0, 1),
+          SelectCandidatesParam(reqCap2, 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates1).containsExactlyInAnyOrder(Pair(reqCap1, agent1.address),
             Pair(reqCap2, agent3.address))
@@ -527,7 +579,10 @@ class RemoteAgentRegistryTest {
         assertThat(agent3.inquiryCount).isEqualTo(2)
       }
 
-      val candidates2 = registry.selectCandidates(listOf(reqCap1 to 1, reqCap2 to 1))
+      val candidates2 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(reqCap1, 0, 0, 1),
+          SelectCandidatesParam(reqCap2, 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates2).containsExactlyInAnyOrder(Pair(reqCap1, agent1.address),
             Pair(reqCap2, agent3.address))
@@ -540,7 +595,10 @@ class RemoteAgentRegistryTest {
         assertThat(agent3.inquiryCount).isEqualTo(3)
       }
 
-      val candidates3 = registry.selectCandidates(listOf(reqCap1 to 1, reqCap2 to 1))
+      val candidates3 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(reqCap1, 0, 0, 1),
+          SelectCandidatesParam(reqCap2, 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates3).containsExactlyInAnyOrder(Pair(reqCap1, agent1.address),
             Pair(reqCap2, agent2.address))
@@ -631,7 +689,9 @@ class RemoteAgentRegistryTest {
       registry.register(agentId1)
       registry.register(agentId2)
 
-      val candidates1 = registry.selectCandidates(listOf(emptyList<String>() to 1))
+      val candidates1 = registry.selectCandidates(listOf(
+          SelectCandidatesParam(emptyList(), 0, 0, 1)
+      ))
       ctx.coVerify {
         assertThat(inquiryCount1).isEqualTo(1)
         assertThat(allocateCount1).isEqualTo(0)
@@ -647,7 +707,9 @@ class RemoteAgentRegistryTest {
         assertThat(inquiryCount2).isEqualTo(1)
         assertThat(allocateCount2).isEqualTo(0)
 
-        val candidates2 = registry.selectCandidates(listOf(emptyList<String>() to 1))
+        val candidates2 = registry.selectCandidates(listOf(
+            SelectCandidatesParam(emptyList(), 0, 0, 1)
+        ))
         assertThat(candidates2).containsExactly(Pair(emptyList(), address2))
         val agent2 = registry.tryAllocate(address2, processChainId)
         assertThat(agent2).isNotNull

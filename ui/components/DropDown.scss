@@ -4,7 +4,7 @@
   position: relative;
 
   :global(a) {
-    color: $gray-700;
+    color: var(--gray-700);
     text-decoration: none;
   }
 
@@ -18,14 +18,13 @@
 
   .dropdown-btn {
     font-size: $font-size-base;
-    color: $gray-700;
-    border: 1px solid $gray-300;
+    color: var(--gray-700);
+    background-color: var(--gray-100);
+    border: 1px solid var(--border-color);
     border-radius: $border-radius;
     padding: .6em .75em .4em 1em;
     cursor: pointer;
-    margin-left: $spacer;
     white-space: nowrap;
-    margin-top: 2rem;
 
     :global(svg) {
       margin-top: -1px;
@@ -33,21 +32,32 @@
     }
 
     &.primary {
-      background-color: $primary;
-      border-color: $primary;
-      color: #fff;
+      background-color: var(--primary);
+      border-color: var(--primary);
+      color: var(--bg);
+    }
+
+    &.small {
+      padding: .3em .5em .2em .5em;
+      font-weight: 300;
+      font-size: $font-size-sm;
+
+      :global(svg) {
+        margin-top: 0;
+        width: 1.2em;
+      }
     }
 
     &:hover, &:focus {
-      background-color: $gray-700;
-      border-color: $gray-700;
-      color: #fff;
+      background-color: var(--gray-700);
+      border-color: var(--gray-700);
+      color:  var(--bg);
       outline: none;
     }
 
     @media (max-width: $sm) {
       padding: .5em;
-      .dropdown-text {
+      .dropdown-text:not(.force-visible) {
         display: none;
       }
     }
@@ -69,30 +79,32 @@
       display: block;
     }
 
-    @media (max-width: $sm) {
-      right: 0;
-      left: auto;
+    &:not(.force-title-visible) {
+      @media (max-width: $sm) {
+        right: 0;
+        left: auto;
+      }
     }
 
     :global(ul) {
-      background-color: #fff;
-      margin: $spacer / 4 0 0 0;
+      background-color: var(--bg);
+      margin: $spacer * 0.25 0 0 0;
       list-style-type: none;
 
-      color: $gray-700;
-      border: 1px solid $gray-300;
+      color: var(--gray-700);
+      border: 1px solid var(--border-color);
       border-radius: $border-radius;
       padding: .35em 0em;
 
-      box-shadow: 0px 0px 5px rgba(0, 0, 0, 0.1);
+      box-shadow: var(--drop-down-box-shadow);
 
       :global(li) {
         display: block;
-        padding: $spacer / 4 1em;
+        padding: $spacer * 0.25 1em;
         cursor: pointer;
 
         &:hover {
-          background-color: $gray-300;
+          background-color: var(--gray-300);
         }
       }
     }

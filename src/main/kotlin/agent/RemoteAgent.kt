@@ -17,6 +17,7 @@ import io.vertx.kotlin.core.json.json
 import io.vertx.kotlin.core.json.obj
 import io.vertx.kotlin.coroutines.await
 import io.vertx.kotlin.coroutines.receiveChannelHandler
+import kotlinx.coroutines.isActive
 import model.processchain.ProcessChain
 import org.slf4j.LoggerFactory
 import java.rmi.RemoteException
@@ -36,6 +37,9 @@ class RemoteAgent(override val id: String, private val vertx: Vertx) : Agent {
     private const val COUNTER_NAME = "RemoteAgent.Sequence"
 
     private val log = LoggerFactory.getLogger(RemoteAgent::class.java)
+
+    private val AGENT_LEFT_EXCEPTION = CancellationException(
+        "Agent left the cluster before process chain execution could be finished")
   }
 
   /**
@@ -63,12 +67,14 @@ class RemoteAgent(override val id: String, private val vertx: Vertx) : Agent {
     log.trace("Registered handler for replies listening on $replyAddress")
 
     try {
-      // abort when cluster node has left - use local consumer here because
-      // we only need to listen to our own REMOTE_AGENT_LEFT messages
-      val agentLeftConsumer = vertx.eventBus().localConsumer<String>(
-          AddressConstants.REMOTE_AGENT_LEFT) { agentLeftMsg ->
-        if (id == agentLeftMsg.body()) {
-          adapter.cancel(CancellationException("Agent left the cluster"))
+      // abort when cluster node has left
+      val agentLeftConsumer = vertx.eventBus().localConsumer<JsonObject>(
+          AddressConstants.CLUSTER_NODE_LEFT) { clusterNodeLeftMsg ->
+        val agentId = AddressConstants.REMOTE_AGENT_ADDRESS_PREFIX +
+            clusterNodeLeftMsg.body().getString("agentId")
+        val mainId = id.indexOf('[').let { i -> if (i < 0) id else id.substring(0, i) }
+        if (mainId == agentId && adapter.isActive) {
+          adapter.cancel(AGENT_LEFT_EXCEPTION)
         }
       }
 
@@ -112,6 +118,12 @@ class RemoteAgent(override val id: String, private val vertx: Vertx) : Agent {
       } finally {
         agentLeftConsumer.unregister()
       }
+    } catch (e: CancellationException) {
+      if (e === AGENT_LEFT_EXCEPTION || e.cause === AGENT_LEFT_EXCEPTION ||
+          e.message == AGENT_LEFT_EXCEPTION.message) {
+        throw IllegalStateException(e.message)
+      }
+      throw e
     } finally {
       replyConsumer.unregister()
       log.trace("Unregistered handler for replies listening on $replyAddress")

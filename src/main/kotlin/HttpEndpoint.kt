@@ -1,3 +1,4 @@
+import AddressConstants.CLUSTER_NODE_LEFT
 import AddressConstants.CONTROLLER_LOOKUP_NOW
 import AddressConstants.LOCAL_AGENT_ADDRESS_PREFIX
 import AddressConstants.LOGS_PROCESSCHAINS_PREFIX
@@ -41,6 +42,8 @@ import com.github.zafarkhaja.semver.expr.CompositeExpression.Helper.gte
 import com.github.zafarkhaja.semver.expr.CompositeExpression.Helper.lte
 import db.MetadataRegistry
 import db.MetadataRegistryFactory
+import db.PluginRegistry
+import db.PluginRegistryFactory
 import db.SubmissionRegistry
 import db.SubmissionRegistryFactory
 import db.VMRegistry
@@ -77,7 +80,6 @@ import io.vertx.ext.web.handler.sockjs.SockJSBridgeOptions
 import io.vertx.ext.web.handler.sockjs.SockJSHandler
 import io.vertx.ext.web.impl.ParsableMIMEValue
 import io.vertx.kotlin.core.json.json
-import io.vertx.kotlin.core.json.jsonArrayOf
 import io.vertx.kotlin.core.json.jsonObjectOf
 import io.vertx.kotlin.core.json.obj
 import io.vertx.kotlin.coroutines.CoroutineVerticle
@@ -85,6 +87,8 @@ import io.vertx.kotlin.coroutines.await
 import io.vertx.kotlin.coroutines.toReceiveChannel
 import io.vertx.micrometer.PrometheusScrapingHandler
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import model.Submission
@@ -92,7 +96,14 @@ import model.Version
 import model.cloud.VM
 import model.workflow.Workflow
 import org.apache.commons.text.WordUtils
+import org.parboiled.errors.ParserRuntimeException
 import org.slf4j.LoggerFactory
+import search.QueryCompiler
+import search.SearchResultMatcher
+import search.Type
+import java.time.DateTimeException
+import java.time.ZoneId
+import java.time.zone.ZoneRulesException
 import java.util.regex.Pattern
 import kotlin.math.max
 import com.github.zafarkhaja.semver.Version as SemVersion
@@ -113,6 +124,7 @@ class HttpEndpoint : CoroutineVerticle() {
   }
 
   private lateinit var metadataRegistry: MetadataRegistry
+  private lateinit var pluginRegistry: PluginRegistry
   private lateinit var agentRegistry: AgentRegistry
   private lateinit var submissionRegistry: SubmissionRegistry
   private lateinit var vmRegistry: VMRegistry
@@ -121,6 +133,7 @@ class HttpEndpoint : CoroutineVerticle() {
 
   override suspend fun start() {
     metadataRegistry = MetadataRegistryFactory.create(vertx)
+    pluginRegistry = PluginRegistryFactory.create()
     agentRegistry = AgentRegistryFactory.create(vertx)
     submissionRegistry = SubmissionRegistryFactory.create(vertx)
     vmRegistry = VMRegistryFactory.create(vertx)
@@ -192,6 +205,11 @@ class HttpEndpoint : CoroutineVerticle() {
         .produces("text/html")
         .handler(this::onNewWorkflow)
 
+    router.get("/search")
+        .produces("application/json")
+        .produces("text/html")
+        .handler(this::onGetSearch)
+
     router.get("/services")
         .produces("application/json")
         .produces("text/html")
@@ -201,6 +219,16 @@ class HttpEndpoint : CoroutineVerticle() {
         .produces("application/json")
         .produces("text/html")
         .handler(this::onGetServiceById)
+
+    router.get("/plugins")
+        .produces("application/json")
+        .produces("text/html")
+        .handler(this::onGetPlugins)
+
+    router.get("/plugins/:name/?")
+        .produces("application/json")
+        .produces("text/html")
+        .handler(this::onGetPluginByName)
 
     router.get("/processchains")
         .produces("application/json")
@@ -274,7 +302,7 @@ class HttpEndpoint : CoroutineVerticle() {
     router.get("/favicons/*").handler(placeholderHandler(true))
 
     val sockJSHandler = SockJSHandler.create(vertx)
-    sockJSHandler.bridge(SockJSBridgeOptions()
+    val sockJSRouter = sockJSHandler.bridge(SockJSBridgeOptions()
         .addOutboundPermitted(PermittedOptions()
             .setAddressRegex(Pattern.quote(LOGS_PROCESSCHAINS_PREFIX) + ".+"))
         .addOutboundPermitted(PermittedOptions()
@@ -312,6 +340,8 @@ class HttpEndpoint : CoroutineVerticle() {
         .addOutboundPermitted(PermittedOptions()
             .setAddress(PROCESSCHAIN_PROGRESS_CHANGED))
         .addOutboundPermitted(PermittedOptions()
+            .setAddress(CLUSTER_NODE_LEFT))
+        .addOutboundPermitted(PermittedOptions()
             .setAddress(REMOTE_AGENT_ADDED))
         .addOutboundPermitted(PermittedOptions()
             .setAddress(REMOTE_AGENT_LEFT))
@@ -340,7 +370,7 @@ class HttpEndpoint : CoroutineVerticle() {
     router.route("/eventbus/*")
         .handler(BodyHandler.create()
             .setBodyLimit(config.getLong(ConfigConstants.HTTP_POST_MAX_SIZE, 1024L * 1024L)))
-        .handler(sockJSHandler)
+        .subRouter(sockJSRouter)
 
     val baseRouter = Router.router(vertx)
     baseRouter.route("$basePath/*").subRouter(router)
@@ -415,8 +445,8 @@ class HttpEndpoint : CoroutineVerticle() {
     }
 
     // configure max age in seconds
-    val maxAge = config.getInteger(ConfigConstants.HTTP_CORS_MAX_AGE, -1)
-    corsHandler.maxAgeSeconds(maxAge)
+    val maxAgeSeconds = config.getInteger(ConfigConstants.HTTP_CORS_MAX_AGE_SECONDS, -1)
+    corsHandler.maxAgeSeconds(maxAgeSeconds)
 
     return corsHandler
   }
@@ -669,7 +699,6 @@ class HttpEndpoint : CoroutineVerticle() {
               receivedAny = false
               return@setPeriodic
             }
-            @Suppress("ThrowableNotThrown")
             channel.cancel(CancellationException("Timeout while waiting for " +
                 "log data from agent"))
             vertx.cancelTimer(timerId)
@@ -858,6 +887,118 @@ class HttpEndpoint : CoroutineVerticle() {
   }
 
   /**
+   * Search registry based on a user-defined query
+   * @param ctx the routing context
+   */
+  private fun onGetSearch(ctx: RoutingContext) {
+    if (prefersHtml(ctx)) {
+      renderAsset("ui/search/index.html", ctx.response())
+    } else {
+      val q = ctx.request().getParam("q") ?: ""
+      val offset = max(0, ctx.request().getParam("offset")?.toIntOrNull() ?: 0)
+      val size = ctx.request().getParam("size")?.toIntOrNull() ?: 10
+
+      val count = ctx.request().getParam("count", "estimate").lowercase()
+      if (count != "none" && count != "estimate" && count != "exact") {
+        renderError(ctx, 400, "Parameter `count' must be one of `none', " +
+            "`estimate', or `exact'")
+        return
+      }
+
+      val timeZone = try {
+        ctx.request().getParam("timeZone")?.let { ZoneId.of(it) } ?: ZoneId.systemDefault()
+      } catch (e: ZoneRulesException) {
+        renderError(ctx, 400, "Unknown timezone")
+        return
+      } catch (e: DateTimeException) {
+        renderError(ctx, 400, "Invalid timezone")
+        return
+      }
+
+      launch {
+        val query = try {
+          QueryCompiler.compile(q, timeZone)
+        } catch (e: ParserRuntimeException) {
+          renderError(ctx, 400, e.message)
+          return@launch
+        }
+
+        val countJobs = if (count != "none") {
+          Type.values().map { type ->
+            async {
+              type to submissionRegistry.searchCount(query, type, count == "estimate")
+            }
+          }
+        } else {
+          emptyList()
+        }
+
+        val searchResults = submissionRegistry.search(query, size = size, offset = offset)
+        val counts = countJobs.awaitAll()
+
+        var countedWorkflows = 0L
+        var countedProcessChains = 0L
+        val results = JsonArray()
+        for (sr in searchResults) {
+          val matches = SearchResultMatcher.toMatch(sr, query)
+          val ro = jsonObjectOf(
+              "id" to sr.id,
+              "type" to sr.type,
+              "requiredCapabilities" to sr.requiredCapabilities,
+              "status" to sr.status
+          )
+          if (sr.name != null) {
+            ro.put("name", sr.name)
+          }
+          if (sr.startTime != null) {
+            ro.put("startTime", sr.startTime)
+          }
+          if (sr.endTime != null) {
+            ro.put("endTime", sr.endTime)
+          }
+          ro.put("matches", matches)
+          results.add(ro)
+
+          when (sr.type) {
+            Type.WORKFLOW -> countedWorkflows++
+            Type.PROCESS_CHAIN -> countedProcessChains++
+          }
+        }
+
+        var total = 0L
+        val result = JsonObject()
+        if (count != "none") {
+          val countsObj = JsonObject()
+          for (c in counts) {
+            val v = when (c.first) {
+              Type.WORKFLOW -> if (countedWorkflows + countedProcessChains < size ||
+                  countedWorkflows > c.second) countedWorkflows else c.second
+              Type.PROCESS_CHAIN -> if (countedWorkflows + countedProcessChains < size ||
+                  countedProcessChains > c.second) countedProcessChains else c.second
+            }
+            countsObj.put(c.first.type, v)
+            total += v
+          }
+          countsObj.put("total", total)
+          result.put("counts", countsObj)
+        }
+        result.put("results", results)
+
+        ctx.response()
+            .putHeader("content-type", "application/json")
+            .putHeader("x-page-size", size.toString())
+            .putHeader("x-page-offset", offset.toString())
+
+        if (count != "none") {
+          ctx.response().putHeader("x-page-total", total.toString())
+        }
+
+        ctx.response().end(JsonUtils.mapper.writeValueAsString(result))
+      }
+    }
+  }
+
+  /**
    * Get a list of all services
    * @param ctx the routing context
    */
@@ -895,6 +1036,48 @@ class HttpEndpoint : CoroutineVerticle() {
           ctx.response()
               .putHeader("content-type", "application/json")
               .end(serviceObj.encode())
+        }
+      }
+    }
+  }
+
+  /**
+   * Get a list of all plugins
+   * @param ctx the routing context
+   */
+  private fun onGetPlugins(ctx: RoutingContext) {
+    if (prefersHtml(ctx)) {
+      renderAsset("ui/plugins/index.html", ctx.response())
+    } else {
+      launch {
+        val plugins = pluginRegistry.getAllPlugins()
+        val result = JsonArray(plugins.map { JsonUtils.toJson(it) }).encode()
+        ctx.response()
+          .putHeader("content-type", "application/json")
+          .end(result)
+      }
+    }
+  }
+
+  /**
+   * Get a single plugin by its name
+   * @param ctx the routing context
+   */
+  private fun onGetPluginByName(ctx: RoutingContext) {
+    if (prefersHtml(ctx)) {
+      renderAsset("ui/plugins/[name].html/index.html", ctx.response())
+    } else {
+      launch {
+        val name = ctx.pathParam("name")
+        val plugin = pluginRegistry.getAllPlugins().firstOrNull { it.name == name }
+
+        if (plugin == null) {
+          renderError(ctx, 404, "There is no plugin with name `$name'")
+        } else {
+          val pluginObj = JsonUtils.toJson(plugin)
+          ctx.response()
+            .putHeader("content-type", "application/json")
+            .end(pluginObj.encode())
         }
       }
     }
@@ -959,20 +1142,11 @@ class HttpEndpoint : CoroutineVerticle() {
         }
 
         val total = submissionRegistry.countSubmissions(status)
-        val submissions = submissionRegistry.findSubmissionsRaw(status, size, offset, -1)
+        val submissions = submissionRegistry.findSubmissionsRaw(status, size,
+            offset, -1, excludeWorkflows = true, excludeSources = true)
+        submissions.forEach { amendSubmission(it) }
 
-        val list = submissions.map { submission ->
-          val reqCaps = Submission.collectRequiredCapabilities(submission,
-              metadataRegistry.findServices())
-
-          // do not unnecessarily encode workflow to save time for large workflows
-          submission.remove("workflow")
-
-          amendSubmission(submission)
-          submission.put("requiredCapabilities", jsonArrayOf(*(reqCaps.toTypedArray())))
-        }
-
-        val encodedJson = JsonArray(list).encode()
+        val encodedJson = JsonUtils.mapper.writeValueAsString(submissions)
         ctx.response()
             .putHeader("content-type", "application/json")
             .putHeader("x-page-size", size.toString())
@@ -998,12 +1172,7 @@ class HttpEndpoint : CoroutineVerticle() {
           renderError(ctx, 404, "There is no workflow with ID `$id'")
         } else {
           val json = JsonUtils.toJson(submission)
-          val reqCaps = Submission.collectRequiredCapabilities(json,
-              metadataRegistry.findServices())
-
           amendSubmission(json, true)
-          json.put("requiredCapabilities", jsonArrayOf(*(reqCaps.toTypedArray())))
-
           ctx.response()
               .putHeader("content-type", "application/json")
               .end(json.encode())
@@ -1123,13 +1292,15 @@ class HttpEndpoint : CoroutineVerticle() {
    */
   private fun onPostWorkflow(ctx: RoutingContext) {
     // parse workflow
-    val workflowJson: Map<String, Any> = try {
-      val str = ctx.body().asString().trim()
-      if (str[0] == '{') {
+    val (workflowJson, source) = try {
+      val str = ctx.body().asString()
+      val first = str.indexOfFirst { !it.isWhitespace() }
+      val json: Map<String, Any> = if (str[first] == '{') {
         JsonUtils.readValue(str)
       } else {
         YamlUtils.readValue(str)
       }
+      json to str
     } catch (e: Exception) {
       renderError(ctx, 400, "Invalid workflow JSON: " + e.message)
       return
@@ -1187,8 +1358,12 @@ class HttpEndpoint : CoroutineVerticle() {
     }
 
     // store submission in registry
-    val submission = Submission(workflow = workflow)
     launch {
+      val reqCaps = Submission.collectRequiredCapabilities(workflow,
+          metadataRegistry.findServices())
+      val submission = Submission(workflow = workflow,
+          requiredCapabilities = reqCaps, source = source)
+
       try {
         submissionRegistry.addSubmission(submission)
         ctx.response()
@@ -1448,6 +1623,7 @@ class HttpEndpoint : CoroutineVerticle() {
             currentStatus != SubmissionRegistry.ProcessChainStatus.RUNNING) {
           // 422 Unprocessable Entity
           renderError(ctx, 422, "Cannot change priority of a finished process chain")
+          return@launch
         }
 
         if (status == SubmissionRegistry.ProcessChainStatus.CANCELLED) {

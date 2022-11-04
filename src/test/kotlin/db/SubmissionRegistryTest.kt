@@ -21,7 +21,11 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.extension.ExtendWith
+import search.QueryCompiler
+import search.Type
 import java.time.Instant
+import java.time.LocalDateTime
+import java.time.ZoneId
 
 /**
  * Tests for all [SubmissionRegistry] implementations
@@ -172,6 +176,75 @@ abstract class SubmissionRegistryTest {
       ctx.verify {
         assertThat(r8).isEqualTo(listOf(js4))
         assertThat(r9).isEqualTo(listOf(js3, js1))
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
+  fun findSubmissionsExcludes(vertx: Vertx, ctx: VertxTestContext) {
+    val s1 = Submission(workflow = Workflow(), status = Submission.Status.RUNNING,
+        source = "foobar")
+    val s2 = Submission(workflow = Workflow(), status = Submission.Status.SUCCESS,
+        source = "something else")
+    val s3 = Submission(workflow = Workflow(), status = Submission.Status.RUNNING)
+
+    CoroutineScope(vertx.dispatcher()).launch {
+      submissionRegistry.addSubmission(s1)
+      submissionRegistry.addSubmission(s2)
+      submissionRegistry.addSubmission(s3)
+      val js1 = JsonUtils.toJson(s1)
+      val js2 = JsonUtils.toJson(s2)
+      val js3 = JsonUtils.toJson(s3)
+
+      val r1 = submissionRegistry.findSubmissionsRaw()
+      ctx.verify {
+        assertThat(r1).allMatch { it.containsKey("workflow") }
+        assertThat(r1).anyMatch { it.containsKey("source") }
+        assertThat(r1).isEqualTo(listOf(js1, js2, js3))
+      }
+
+      val js1WithoutWorkflow = js1.copy()
+      js1WithoutWorkflow.remove("workflow")
+      val js2WithoutWorkflow = js2.copy()
+      js2WithoutWorkflow.remove("workflow")
+      val js3WithoutWorkflow = js3.copy()
+      js3WithoutWorkflow.remove("workflow")
+
+      val r2 = submissionRegistry.findSubmissionsRaw(excludeWorkflows = true)
+      ctx.verify {
+        assertThat(r2).noneMatch { it.containsKey("workflow") }
+        assertThat(r2).anyMatch { it.containsKey("source") }
+        assertThat(r2).isEqualTo(listOf(js1WithoutWorkflow, js2WithoutWorkflow, js3WithoutWorkflow))
+      }
+
+      val js1WithoutSource = js1.copy()
+      js1WithoutSource.remove("source")
+      val js2WithoutSource = js2.copy()
+      js2WithoutSource.remove("source")
+      val js3WithoutSource = js3.copy()
+      js3WithoutSource.remove("source")
+
+      val r3 = submissionRegistry.findSubmissionsRaw(excludeSources = true)
+      ctx.verify {
+        assertThat(r3).allMatch { it.containsKey("workflow") }
+        assertThat(r3).noneMatch { it.containsKey("source") }
+        assertThat(r3).isEqualTo(listOf(js1WithoutSource, js2WithoutSource, js3WithoutSource))
+      }
+
+      val js1WithoutBoth = js1WithoutWorkflow.copy()
+      js1WithoutBoth.remove("source")
+      val js2WithoutBoth = js2WithoutWorkflow.copy()
+      js2WithoutBoth.remove("source")
+      val js3WithoutBoth = js3WithoutWorkflow.copy()
+      js3WithoutBoth.remove("source")
+
+      val r4 = submissionRegistry.findSubmissionsRaw(excludeWorkflows = true, excludeSources = true)
+      ctx.verify {
+        assertThat(r4).noneMatch { it.containsKey("workflow") }
+        assertThat(r4).noneMatch { it.containsKey("source") }
+        assertThat(r4).isEqualTo(listOf(js1WithoutBoth, js2WithoutBoth, js3WithoutBoth))
       }
 
       ctx.completeNow()
@@ -1065,28 +1138,38 @@ abstract class SubmissionRegistryTest {
   fun countProcessChains(vertx: Vertx, ctx: VertxTestContext) {
     val s1 = Submission(workflow = Workflow(), status = Submission.Status.RUNNING)
     val pc11 = ProcessChain()
-    val pc12 = ProcessChain()
+    val pc12 = ProcessChain(priority = 5)
     val s2 = Submission(workflow = Workflow(), status = Submission.Status.SUCCESS)
-    val pc21 = ProcessChain()
+    val pc21 = ProcessChain(priority = 10)
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val r1 = submissionRegistry.countProcessChains()
-      ctx.verify {
-        assertThat(r1).isEqualTo(0)
+      ctx.coVerify {
+        val r = submissionRegistry.countProcessChains()
+        assertThat(r).isEqualTo(0)
       }
 
       submissionRegistry.addSubmission(s1)
       submissionRegistry.addProcessChains(listOf(pc11, pc12), s1.id)
-      val r2 = submissionRegistry.countProcessChains()
-      ctx.verify {
-        assertThat(r2).isEqualTo(2)
+      ctx.coVerify {
+        val r = submissionRegistry.countProcessChains()
+        assertThat(r).isEqualTo(2)
+      }
+
+      ctx.coVerify {
+        val r = submissionRegistry.countProcessChains(minPriority = 5)
+        assertThat(r).isEqualTo(1)
       }
 
       submissionRegistry.addSubmission(s2)
       submissionRegistry.addProcessChains(listOf(pc21), s2.id)
-      val r3 = submissionRegistry.countProcessChains()
-      ctx.verify {
-        assertThat(r3).isEqualTo(3)
+      ctx.coVerify {
+        val r = submissionRegistry.countProcessChains()
+        assertThat(r).isEqualTo(3)
+      }
+
+      ctx.coVerify {
+        val r = submissionRegistry.countProcessChains(minPriority = 5)
+        assertThat(r).isEqualTo(2)
       }
 
       ctx.completeNow()
@@ -1263,24 +1346,28 @@ abstract class SubmissionRegistryTest {
     val rcs2 = setOf("rc1", "rc2")
 
     val s = Submission(workflow = Workflow())
-    val pc1 = ProcessChain(requiredCapabilities = rcs1)
+    val pc1 = ProcessChain(requiredCapabilities = rcs1, priority = 3)
     val pc2 = ProcessChain()
-    val pc3 = ProcessChain(requiredCapabilities = rcs1)
-    val pc4 = ProcessChain(requiredCapabilities = rcs2)
-    val pc5 = ProcessChain(requiredCapabilities = rcs2)
-    val pc6 = ProcessChain(requiredCapabilities = rcs1)
+    val pc3 = ProcessChain(requiredCapabilities = rcs1, priority = 4)
+    val pc4 = ProcessChain(requiredCapabilities = rcs2, priority = 1)
+    val pc5 = ProcessChain(requiredCapabilities = rcs2, priority = 1)
+    val pc6 = ProcessChain(requiredCapabilities = rcs1, priority = 5)
+    val pc7 = ProcessChain(requiredCapabilities = rcs1, priority = 10)
 
     CoroutineScope(vertx.dispatcher()).launch {
       submissionRegistry.addSubmission(s)
-      submissionRegistry.addProcessChains(listOf(pc1, pc2, pc3, pc4, pc5, pc6), s.id)
+      submissionRegistry.addProcessChains(listOf(pc1, pc2, pc3, pc4, pc5, pc6, pc7), s.id)
+      submissionRegistry.setProcessChainStatus(pc7.id, SubmissionRegistry.ProcessChainStatus.SUCCESS)
 
       val r = submissionRegistry.findProcessChainRequiredCapabilities(
           SubmissionRegistry.ProcessChainStatus.REGISTERED)
       ctx.verify {
-        assertThat(r).hasSize(3)
-        assertThat(r).anyMatch { it.toSet() == rcs1 }
-        assertThat(r).anyMatch { it.toSet() == rcs2 }
-        assertThat(r).anyMatch { it.isEmpty() }
+        // cast rcs to sets so the comparison can work
+        assertThat(r.map { it.copy(first = it.first.toSet()) }).containsExactlyInAnyOrder(
+            rcs1 to 3..5,
+            rcs2 to 1..1,
+            emptySet<String>() to 0..0
+        )
       }
 
       ctx.completeNow()
@@ -1376,6 +1463,40 @@ abstract class SubmissionRegistryTest {
   }
 
   @Test
+  fun fetchNextProcessChainMinPriority(vertx: Vertx, ctx: VertxTestContext) {
+    val s = Submission(workflow = Workflow())
+    val pc1 = ProcessChain(priority = -10)
+    val pc2 = ProcessChain()
+    val pc3 = ProcessChain(priority = 10)
+    val pc4 = ProcessChain(priority = 3)
+    val pc5 = ProcessChain()
+
+    CoroutineScope(vertx.dispatcher()).launch {
+      submissionRegistry.addSubmission(s)
+      submissionRegistry.addProcessChains(listOf(pc1, pc2, pc3, pc4, pc5), s.id)
+      val pcA = submissionRegistry.fetchNextProcessChain(
+          SubmissionRegistry.ProcessChainStatus.REGISTERED,
+          SubmissionRegistry.ProcessChainStatus.RUNNING,
+          minPriority = 3)
+      val pcB = submissionRegistry.fetchNextProcessChain(
+          SubmissionRegistry.ProcessChainStatus.REGISTERED,
+          SubmissionRegistry.ProcessChainStatus.RUNNING,
+          minPriority = 3)
+      val pcC = submissionRegistry.fetchNextProcessChain(
+          SubmissionRegistry.ProcessChainStatus.REGISTERED,
+          SubmissionRegistry.ProcessChainStatus.RUNNING,
+          minPriority = 3)
+      ctx.verify {
+        assertThat(pcA).isEqualTo(pc3)
+        assertThat(pcB).isEqualTo(pc4)
+        assertThat(pcC).isNull()
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
   fun fetchNextProcessChainRequiredCapabilities(vertx: Vertx, ctx: VertxTestContext) {
     val s = Submission(workflow = Workflow())
     val pc1 = ProcessChain(requiredCapabilities = setOf("docker", "sleep"))
@@ -1405,6 +1526,48 @@ abstract class SubmissionRegistryTest {
         assertThat(pcB).isEqualTo(pc3)
         assertThat(pcC).isEqualTo(pc1)
         assertThat(pcD).isEqualTo(pc2)
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
+  fun fetchNextProcessChainRequiredCapabilitiesMinPriority(vertx: Vertx, ctx: VertxTestContext) {
+    val s = Submission(workflow = Workflow())
+    val pc1 = ProcessChain(requiredCapabilities = setOf("docker"), priority = 10)
+    val pc2 = ProcessChain(requiredCapabilities = setOf("docker", "sleep"), priority = 20)
+    val pc3 = ProcessChain(requiredCapabilities = setOf("docker"), priority = 5)
+
+    CoroutineScope(vertx.dispatcher()).launch {
+      submissionRegistry.addSubmission(s)
+      submissionRegistry.addProcessChains(listOf(pc1, pc2, pc3), s.id)
+      val pcA = submissionRegistry.fetchNextProcessChain(
+          SubmissionRegistry.ProcessChainStatus.REGISTERED,
+          SubmissionRegistry.ProcessChainStatus.REGISTERED,
+          listOf("docker"), minPriority = 10)
+      val pcB = submissionRegistry.fetchNextProcessChain(
+          SubmissionRegistry.ProcessChainStatus.REGISTERED,
+          SubmissionRegistry.ProcessChainStatus.SUCCESS,
+          listOf("docker"), minPriority = 5)
+      val pcC = submissionRegistry.fetchNextProcessChain(
+          SubmissionRegistry.ProcessChainStatus.REGISTERED,
+          SubmissionRegistry.ProcessChainStatus.SUCCESS,
+          listOf("docker"), minPriority = 10)
+      val pcD = submissionRegistry.fetchNextProcessChain(
+          SubmissionRegistry.ProcessChainStatus.REGISTERED,
+          SubmissionRegistry.ProcessChainStatus.SUCCESS,
+          listOf("docker"), minPriority = 5)
+      val pcE = submissionRegistry.fetchNextProcessChain(
+          SubmissionRegistry.ProcessChainStatus.REGISTERED,
+          SubmissionRegistry.ProcessChainStatus.SUCCESS,
+          listOf("docker"), minPriority = 5)
+      ctx.verify {
+        assertThat(pcA).isEqualTo(pc1)
+        assertThat(pcB).isEqualTo(pc1)
+        assertThat(pcC).isNull()
+        assertThat(pcD).isEqualTo(pc3)
+        assertThat(pcE).isNull()
       }
 
       ctx.completeNow()
@@ -2120,6 +2283,685 @@ abstract class SubmissionRegistryTest {
         }.isInstanceOf(NoSuchElementException::class.java)
         ctx.completeNow()
       }
+    }
+  }
+
+  @Test
+  fun searchEmpty(vertx: Vertx, ctx: VertxTestContext) {
+    CoroutineScope(vertx.dispatcher()).launch {
+      val s = Submission(workflow = Workflow())
+      val pc = ProcessChain()
+
+      submissionRegistry.addSubmission(s)
+      submissionRegistry.addProcessChains(listOf(pc), s.id)
+
+      ctx.coVerify {
+        // empty query should not return any object
+        val results = submissionRegistry.search(
+            QueryCompiler.compile("")).toList()
+
+        assertThat(results).isEmpty()
+      }
+
+      ctx.coVerify {
+        // we should get no results if we request 0 objects
+        val results = submissionRegistry.search(
+            QueryCompiler.compile(s.id), size = 0).toList()
+
+        assertThat(results).isEmpty()
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
+  fun searchNoMatch(vertx: Vertx, ctx: VertxTestContext) {
+    CoroutineScope(vertx.dispatcher()).launch {
+      val s = Submission(workflow = Workflow(name = "Elvis"),
+          requiredCapabilities = setOf("docker", "sleep"))
+      val pc = ProcessChain(requiredCapabilities = setOf("foo", "bar"))
+
+      submissionRegistry.addSubmission(s)
+      submissionRegistry.addProcessChains(listOf(pc), s.id)
+
+      val results = submissionRegistry.search(
+          QueryCompiler.compile("shouldnotmatch")).toList()
+
+      ctx.verify {
+        assertThat(results).isEmpty()
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
+  fun searchTermsOnly(vertx: Vertx, ctx: VertxTestContext) {
+    CoroutineScope(vertx.dispatcher()).launch {
+      val startTime = Instant.now()
+      val endTime = Instant.now().plusSeconds(10)
+      val s = Submission(workflow = Workflow(name = "Elvis"),
+          requiredCapabilities = setOf("docker", "sleep"),
+          source = "actions: []", status = Submission.Status.SUCCESS,
+          startTime = startTime, endTime = endTime)
+      val pc = ProcessChain(requiredCapabilities = setOf("foo", "bar"))
+
+      val s2 = Submission(workflow = Workflow(name = "Should never match"),
+          requiredCapabilities = setOf())
+      val pc2 = ProcessChain(requiredCapabilities = setOf("something", "else"))
+
+      submissionRegistry.addSubmission(s)
+      submissionRegistry.addProcessChains(listOf(pc), s.id)
+
+      submissionRegistry.addSubmission(s2)
+      submissionRegistry.addProcessChains(listOf(pc2), s2.id)
+
+      val expectedSubmissionError = "failed"
+      submissionRegistry.setSubmissionErrorMessage(s.id, expectedSubmissionError)
+
+      val expectedProcessChainError = "crash"
+      submissionRegistry.setProcessChainErrorMessage(pc.id, expectedProcessChainError)
+
+      submissionRegistry.setProcessChainStartTime(pc.id, startTime)
+
+      ctx.coVerify {
+        submissionRegistry.search(QueryCompiler.compile("docker")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s.id)
+          assertThat(results[0].name).isEqualTo(s.name)
+          assertThat(results[0].status).isEqualTo(s.status.name)
+          assertThat(results[0].requiredCapabilities).isEqualTo(s.requiredCapabilities)
+          assertThat(results[0].errorMessage).isEqualTo(expectedSubmissionError)
+          assertThat(results[0].type).isEqualTo(Type.WORKFLOW)
+          assertThat(results[0].source).isEqualTo(s.source)
+          assertThat(results[0].startTime).isEqualTo(s.startTime)
+          assertThat(results[0].endTime).isEqualTo(s.endTime)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("foo bar")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(pc.id)
+          assertThat(results[0].name).isNull()
+          assertThat(results[0].status).isEqualTo(SubmissionRegistry.ProcessChainStatus.REGISTERED.name)
+          assertThat(results[0].requiredCapabilities).isEqualTo(pc.requiredCapabilities)
+          assertThat(results[0].errorMessage).isEqualTo(expectedProcessChainError)
+          assertThat(results[0].type).isEqualTo(Type.PROCESS_CHAIN)
+          assertThat(results[0].source).isNull()
+          assertThat(results[0].startTime).isEqualTo(startTime)
+          assertThat(results[0].endTime).isNull()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("ELVis")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("aile")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("rash")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(pc.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("vis rash")).toList().let { results ->
+          assertThat(results).hasSize(2)
+          assertThat(results[0].id).isEqualTo(s.id)
+          assertThat(results[1].id).isEqualTo(pc.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("actions")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("succ")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s.id)
+        }
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
+  fun searchLocators(vertx: Vertx, ctx: VertxTestContext) {
+    CoroutineScope(vertx.dispatcher()).launch {
+      val s = Submission(workflow = Workflow(name = "foo"),
+          requiredCapabilities = setOf("docker", "sleep"))
+      val pc = ProcessChain(requiredCapabilities = setOf("foo", "bar"))
+
+      val s2 = Submission(workflow = Workflow(name = "Should never match"),
+          requiredCapabilities = setOf())
+      val pc2 = ProcessChain(requiredCapabilities = setOf("something", "else"))
+
+      submissionRegistry.addSubmission(s)
+      submissionRegistry.addProcessChains(listOf(pc), s.id)
+
+      submissionRegistry.addSubmission(s2)
+      submissionRegistry.addProcessChains(listOf(pc2), s2.id)
+
+      val expectedSubmissionError = "failed"
+      submissionRegistry.setSubmissionErrorMessage(s.id, expectedSubmissionError)
+
+      val expectedProcessChainError = "docker error"
+      submissionRegistry.setProcessChainErrorMessage(pc.id, expectedProcessChainError)
+
+      ctx.coVerify {
+        submissionRegistry.search(QueryCompiler.compile("docker in:rcs")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s.id)
+          assertThat(results[0].id).isEqualTo(s.id)
+          assertThat(results[0].type).isEqualTo(Type.WORKFLOW)
+          assertThat(results[0].errorMessage).isNull()
+          assertThat(results[0].name).isEqualTo(s.name)
+          assertThat(results[0].requiredCapabilities).isEqualTo(s.requiredCapabilities)
+          assertThat(results[0].source).isNull()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("ocke in:name")).toList().let { results ->
+          assertThat(results).isEmpty()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("foo in:name")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s.id)
+          assertThat(results[0].type).isEqualTo(Type.WORKFLOW)
+          assertThat(results[0].errorMessage).isNull()
+          assertThat(results[0].name).isEqualTo(s.name)
+          assertThat(results[0].requiredCapabilities).isEqualTo(s.requiredCapabilities)
+          assertThat(results[0].source).isNull()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("docker in:error")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(pc.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("${s.id} in:id")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("foo in:name in:rcs")).toList().let { results ->
+          assertThat(results).hasSize(2)
+          assertThat(results[0].id).isEqualTo(s.id)
+          assertThat(results[1].id).isEqualTo(pc.id)
+        }
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
+  fun searchFilters(vertx: Vertx, ctx: VertxTestContext) {
+    CoroutineScope(vertx.dispatcher()).launch {
+      val s = Submission(workflow = Workflow(name = "foo"),
+          requiredCapabilities = setOf("docker", "sleep"))
+      val pc = ProcessChain(requiredCapabilities = setOf("foo", "bar"))
+
+      val s2 = Submission(workflow = Workflow(name = "Should never match"),
+          requiredCapabilities = setOf())
+      val pc2 = ProcessChain(requiredCapabilities = setOf("something", "else"))
+
+      submissionRegistry.addSubmission(s)
+      submissionRegistry.addProcessChains(listOf(pc), s.id)
+
+      submissionRegistry.addSubmission(s2)
+      submissionRegistry.addProcessChains(listOf(pc2), s2.id)
+
+      val expectedSubmissionError = "failed"
+      submissionRegistry.setSubmissionErrorMessage(s.id, expectedSubmissionError)
+
+      val expectedProcessChainError = "docker error"
+      submissionRegistry.setProcessChainErrorMessage(pc.id, expectedProcessChainError)
+
+      ctx.coVerify {
+        submissionRegistry.search(QueryCompiler.compile("rcs:docker")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s.id)
+          assertThat(results[0].type).isEqualTo(Type.WORKFLOW)
+          assertThat(results[0].errorMessage).isNull()
+          assertThat(results[0].name).isEqualTo(s.name)
+          assertThat(results[0].requiredCapabilities).isEqualTo(s.requiredCapabilities)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("name:ocke")).toList().let { results ->
+          assertThat(results).isEmpty()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("name:foo")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s.id)
+          assertThat(results[0].type).isEqualTo(Type.WORKFLOW)
+          assertThat(results[0].errorMessage).isNull()
+          assertThat(results[0].name).isEqualTo(s.name)
+          assertThat(results[0].requiredCapabilities).isEqualTo(s.requiredCapabilities)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("error:docker")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(pc.id)
+        }
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
+  fun searchType(vertx: Vertx, ctx: VertxTestContext) {
+    CoroutineScope(vertx.dispatcher()).launch {
+      val s = Submission(workflow = Workflow(name = "foo"),
+          requiredCapabilities = setOf("docker", "sleep"))
+      val pc = ProcessChain(requiredCapabilities = setOf("foo", "bar"))
+
+      val s2 = Submission(workflow = Workflow(name = "Should never match"),
+          requiredCapabilities = setOf())
+      val pc2 = ProcessChain(requiredCapabilities = setOf("something", "else"))
+
+      submissionRegistry.addSubmission(s)
+      submissionRegistry.addProcessChains(listOf(pc), s.id)
+
+      submissionRegistry.addSubmission(s2)
+      submissionRegistry.addProcessChains(listOf(pc2), s2.id)
+
+      val expectedSubmissionError = "failed"
+      submissionRegistry.setSubmissionErrorMessage(s.id, expectedSubmissionError)
+
+      val expectedProcessChainError = "docker error"
+      submissionRegistry.setProcessChainErrorMessage(pc.id, expectedProcessChainError)
+
+      ctx.coVerify {
+        submissionRegistry.search(QueryCompiler.compile("foo is:workflow")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("sleep is:processchain")).toList().let { results ->
+          assertThat(results).isEmpty()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("foo is:processchain")).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(pc.id)
+        }
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
+  fun searchRanking(vertx: Vertx, ctx: VertxTestContext) {
+    CoroutineScope(vertx.dispatcher()).launch {
+      val s1 = Submission(workflow = Workflow(name = "foo"),
+          requiredCapabilities = setOf("docker", "sleep"))
+      val pc = ProcessChain(requiredCapabilities = setOf("foo", "bar"))
+
+      val s2 = Submission(workflow = Workflow(name = "foo"),
+          requiredCapabilities = setOf())
+      val pc2 = ProcessChain(requiredCapabilities = setOf("foo"))
+      val pc3 = ProcessChain(requiredCapabilities = setOf("foo"))
+
+      submissionRegistry.addSubmission(s1)
+      submissionRegistry.addProcessChains(listOf(pc), s1.id)
+
+      submissionRegistry.addSubmission(s2)
+      submissionRegistry.addProcessChains(listOf(pc2, pc3), s2.id)
+
+      ctx.coVerify {
+        submissionRegistry.search(QueryCompiler.compile("foo bar")).toList().let { results ->
+          assertThat(results.map { it.id }).containsExactly(
+              pc.id, // matches best
+              s2.id, // newer than s1
+              s1.id,
+              pc3.id, // newer than pc2
+              pc2.id
+          )
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("foo bar rcs:docker")).toList().let { results ->
+          assertThat(results.map { it.id }).containsExactly(
+              s1.id // the only item that matches
+          )
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("docker rcs:foo")).toList().let { results ->
+          assertThat(results.map { it.id }).isEmpty()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("bar rcs:foo")).toList().let { results ->
+          assertThat(results.map { it.id }).containsExactly(
+              pc.id
+          )
+        }
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
+  fun searchOrder(vertx: Vertx, ctx: VertxTestContext) {
+    CoroutineScope(vertx.dispatcher()).launch {
+      val s = Submission(workflow = Workflow(name = "foo"),
+          requiredCapabilities = setOf("docker", "sleep"))
+      val pc = ProcessChain(requiredCapabilities = setOf("foo", "bar"))
+
+      val s2 = Submission(workflow = Workflow(name = "foo"),
+          requiredCapabilities = setOf())
+      val pc2 = ProcessChain(requiredCapabilities = setOf("foo"))
+      val pc3 = ProcessChain(requiredCapabilities = setOf("foo"))
+
+      submissionRegistry.addSubmission(s)
+      submissionRegistry.addProcessChains(listOf(pc), s.id)
+
+      submissionRegistry.addSubmission(s2)
+      submissionRegistry.addProcessChains(listOf(pc2, pc3), s2.id)
+
+      ctx.coVerify {
+        submissionRegistry.search(QueryCompiler.compile("foo bar docker sleep")).toList().let { results ->
+          assertThat(results).hasSize(5)
+          assertThat(results[0].id).isEqualTo(s.id)
+          assertThat(results[1].id).isEqualTo(pc.id)
+          assertThat(results[2].id).isEqualTo(s2.id)
+          assertThat(results[3].id).isEqualTo(pc3.id)
+          assertThat(results[4].id).isEqualTo(pc2.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("foo bar docker sleep"),
+            order = -1).toList().let { results ->
+          assertThat(results).hasSize(5)
+          assertThat(results[4].id).isEqualTo(s.id)
+          assertThat(results[3].id).isEqualTo(pc.id)
+          assertThat(results[2].id).isEqualTo(s2.id)
+          assertThat(results[1].id).isEqualTo(pc3.id)
+          assertThat(results[0].id).isEqualTo(pc2.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("foo bar docker sleep"),
+            size = 2).toList().let { results ->
+          assertThat(results).hasSize(2)
+          assertThat(results[0].id).isEqualTo(s.id)
+          assertThat(results[1].id).isEqualTo(pc.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("foo bar docker sleep"),
+            size = 3, offset = 2).toList().let { results ->
+          assertThat(results).hasSize(3)
+          assertThat(results[0].id).isEqualTo(s2.id)
+          assertThat(results[1].id).isEqualTo(pc3.id)
+          assertThat(results[2].id).isEqualTo(pc2.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("foo bar docker sleep"),
+            size = 3, offset = 2, order = -1).toList().let { results ->
+          assertThat(results).hasSize(3)
+          assertThat(results[2].id).isEqualTo(s.id)
+          assertThat(results[1].id).isEqualTo(pc.id)
+          assertThat(results[0].id).isEqualTo(s2.id)
+        }
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
+  fun searchCount(vertx: Vertx, ctx: VertxTestContext) {
+    CoroutineScope(vertx.dispatcher()).launch {
+      val s = Submission(workflow = Workflow(name = "foo"))
+      val pc = ProcessChain(requiredCapabilities = setOf("foo", "bar"))
+
+      val s2 = Submission(workflow = Workflow(name = "bar"))
+      val pc2 = ProcessChain()
+      val pc3 = ProcessChain(requiredCapabilities = setOf("foo"))
+
+      submissionRegistry.addSubmission(s)
+      submissionRegistry.addProcessChains(listOf(pc), s.id)
+      submissionRegistry.addSubmission(s2)
+      submissionRegistry.addProcessChains(listOf(pc2, pc3), s2.id)
+
+      ctx.coVerify {
+        val query1 = QueryCompiler.compile("foo bar")
+        val exactWorkflows1 = submissionRegistry.searchCount(query1, Type.WORKFLOW, false)
+        val exactProcessChains1 = submissionRegistry.searchCount(query1, Type.PROCESS_CHAIN, false)
+
+        assertThat(exactWorkflows1).isEqualTo(2)
+        assertThat(exactProcessChains1).isEqualTo(2)
+
+        // Don't compare estimates. Different systems might return different results.
+        // Just execute the methods to make sure they don't throw an exception.
+        submissionRegistry.searchCount(query1, Type.WORKFLOW, true)
+        submissionRegistry.searchCount(query1, Type.PROCESS_CHAIN, true)
+
+        val query2 = QueryCompiler.compile("foo")
+        val exactWorkflows2 = submissionRegistry.searchCount(query2, Type.WORKFLOW, false)
+        val exactProcessChains2 = submissionRegistry.searchCount(query2, Type.PROCESS_CHAIN, false)
+
+        assertThat(exactWorkflows2).isEqualTo(1)
+        assertThat(exactProcessChains2).isEqualTo(2)
+
+        submissionRegistry.searchCount(query2, Type.WORKFLOW, true)
+        submissionRegistry.searchCount(query2, Type.PROCESS_CHAIN, true)
+
+        val query3 = QueryCompiler.compile("foo in:rcs")
+        val exactWorkflows3 = submissionRegistry.searchCount(query3, Type.WORKFLOW, false)
+        val exactProcessChains3 = submissionRegistry.searchCount(query3, Type.PROCESS_CHAIN, false)
+
+        assertThat(exactWorkflows3).isEqualTo(0)
+        assertThat(exactProcessChains3).isEqualTo(2)
+
+        submissionRegistry.searchCount(query3, Type.WORKFLOW, true)
+        submissionRegistry.searchCount(query3, Type.PROCESS_CHAIN, true)
+
+        val query4 = QueryCompiler.compile("name:bar")
+        val exactWorkflows4 = submissionRegistry.searchCount(query4, Type.WORKFLOW, false)
+        val exactProcessChains4 = submissionRegistry.searchCount(query4, Type.PROCESS_CHAIN, false)
+
+        assertThat(exactWorkflows4).isEqualTo(1)
+        assertThat(exactProcessChains4).isEqualTo(0)
+
+        submissionRegistry.searchCount(query4, Type.WORKFLOW, true)
+        submissionRegistry.searchCount(query4, Type.PROCESS_CHAIN, true)
+
+        val query5 = QueryCompiler.compile("")
+        val exactWorkflows5 = submissionRegistry.searchCount(query5, Type.WORKFLOW, false)
+        val exactProcessChains5 = submissionRegistry.searchCount(query5, Type.PROCESS_CHAIN, false)
+
+        assertThat(exactWorkflows5).isEqualTo(0)
+        assertThat(exactProcessChains5).isEqualTo(0)
+
+        val estimateWorkflows5 = submissionRegistry.searchCount(query5, Type.WORKFLOW, true)
+        val estimateProcessChains5 = submissionRegistry.searchCount(query5, Type.PROCESS_CHAIN, true)
+
+        assertThat(estimateWorkflows5).isEqualTo(0)
+        assertThat(estimateProcessChains5).isEqualTo(0)
+
+        val query6 = QueryCompiler.compile("doesnotexist rcs:foo")
+        val exactWorkflows6 = submissionRegistry.searchCount(query6, Type.WORKFLOW, false)
+        val exactProcessChains6 = submissionRegistry.searchCount(query6, Type.PROCESS_CHAIN, false)
+
+        assertThat(exactWorkflows6).isEqualTo(0)
+        assertThat(exactProcessChains6).isEqualTo(0)
+
+        submissionRegistry.searchCount(query6, Type.WORKFLOW, true)
+        submissionRegistry.searchCount(query6, Type.PROCESS_CHAIN, true)
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  @Test
+  fun searchDateTime(vertx: Vertx, ctx: VertxTestContext) {
+    CoroutineScope(vertx.dispatcher()).launch {
+      val s1 = Submission(workflow = Workflow())
+      val pc1 = ProcessChain(requiredCapabilities = setOf("2022-05-30"))
+
+      val s2 = Submission(workflow = Workflow(name = "2022-05-30"))
+      val pc2 = ProcessChain()
+
+      submissionRegistry.addSubmission(s1)
+      submissionRegistry.addProcessChains(listOf(pc1), s1.id)
+      submissionRegistry.addSubmission(s2)
+      submissionRegistry.addProcessChains(listOf(pc2), s2.id)
+
+      val zoneId = ZoneId.systemDefault()
+      val s1StartTime = LocalDateTime.of(2022, 5, 30, 21, 49, 12).atZone(zoneId).toInstant()
+      val s1EndTime = LocalDateTime.of(2022, 5, 31, 10, 52, 36).atZone(zoneId).toInstant()
+      submissionRegistry.setSubmissionStartTime(s1.id, s1StartTime)
+      submissionRegistry.setSubmissionEndTime(s1.id, s1EndTime)
+      submissionRegistry.setSubmissionStartTime(s2.id,
+          LocalDateTime.of(2022, 6, 1, 10, 11, 12).atZone(zoneId).toInstant())
+      submissionRegistry.setSubmissionEndTime(s2.id,
+          LocalDateTime.of(2022, 6, 5, 11, 12, 13).atZone(zoneId).toInstant())
+      submissionRegistry.setProcessChainStartTime(pc2.id,
+          LocalDateTime.of(2022, 6, 1, 10, 11, 15).atZone(zoneId).toInstant())
+      submissionRegistry.setProcessChainEndTime(pc2.id,
+          LocalDateTime.of(2022, 6, 5, 11, 12, 10).atZone(zoneId).toInstant())
+
+      ctx.coVerify {
+        submissionRegistry.search(QueryCompiler.compile("2022-05-30",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s1.id)
+          assertThat(results[0].startTime).isEqualTo(s1StartTime)
+          assertThat(results[0].endTime).isEqualTo(s1EndTime)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("2022-06-01T10:11",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(2)
+          assertThat(results[0].id).isEqualTo(s2.id)
+          assertThat(results[1].id).isEqualTo(pc2.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("2022-06-01T10:11:15",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(pc2.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("2022-06-01T10:11:16",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).isEmpty()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile(">2022-06-01T10:11:13",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(2)
+          assertThat(results[0].id).isEqualTo(s2.id)
+          assertThat(results[1].id).isEqualTo(pc2.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile(">=2022-06-01T10:11:13",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(2)
+          assertThat(results[0].id).isEqualTo(s2.id)
+          assertThat(results[1].id).isEqualTo(pc2.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile(">2022-06-05T11:12:10",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s2.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile(">=2022-06-05T11:12:10",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(2)
+          assertThat(results[0].id).isEqualTo(s2.id)
+          assertThat(results[1].id).isEqualTo(pc2.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile(">2022-06-05",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).isEmpty()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("<2022-06-01",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s1.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("<=2022-06-01",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(3)
+          assertThat(results[0].id).isEqualTo(s2.id)
+          assertThat(results[1].id).isEqualTo(s1.id)
+          assertThat(results[2].id).isEqualTo(pc2.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("<2022-05-31 >=2022-06-05T11:12:13",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(2)
+          assertThat(results[0].id).isEqualTo(s2.id)
+          assertThat(results[1].id).isEqualTo(s1.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("start:2022-05-30",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s1.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("start:2022-05-31",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).isEmpty()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("end:2022-05-30",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).isEmpty()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("end:2022-05-31",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s1.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("2022-05-30..2022-05-31",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s1.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("2022-05-31T10:52:36..2022-06-01T10:11:12",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(2)
+          assertThat(results[0].id).isEqualTo(s2.id)
+          assertThat(results[1].id).isEqualTo(s1.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("2022-05-31T10:52:37..2022-06-01T10:11:12",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(1)
+          assertThat(results[0].id).isEqualTo(s2.id)
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("2022-05-31T10:52:37..2022-06-01T10:11:11",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).isEmpty()
+        }
+
+        submissionRegistry.search(QueryCompiler.compile("2022-06-01..2022-06-05T23:00:00",
+            timeZone = zoneId)).toList().let { results ->
+          assertThat(results).hasSize(2)
+          assertThat(results[0].id).isEqualTo(s2.id)
+          assertThat(results[1].id).isEqualTo(pc2.id)
+        }
+      }
+
+      ctx.completeNow()
     }
   }
 }

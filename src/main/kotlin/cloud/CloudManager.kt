@@ -1,8 +1,8 @@
 package cloud
 
+import AddressConstants.CLUSTER_NODE_LEFT
 import AddressConstants.REMOTE_AGENT_ADDED
 import AddressConstants.REMOTE_AGENT_ADDRESS_PREFIX
-import AddressConstants.REMOTE_AGENT_LEFT
 import AddressConstants.REMOTE_AGENT_MISSING
 import ConfigConstants
 import ConfigConstants.CLOUD_AGENTPOOL
@@ -18,6 +18,7 @@ import db.SetupRegistryFactory
 import db.VMRegistry
 import db.VMRegistryFactory
 import helper.JsonUtils
+import helper.toDuration
 import io.vertx.core.Promise
 import io.vertx.core.json.JsonArray
 import io.vertx.core.json.JsonObject
@@ -33,6 +34,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import model.cloud.PoolAgentParams
 import model.cloud.VM
+import model.retry.RetryPolicy
 import model.setup.Setup
 import org.apache.commons.io.FilenameUtils
 import org.slf4j.LoggerFactory
@@ -41,7 +43,6 @@ import java.io.IOException
 import java.io.StringWriter
 import java.time.Duration
 import java.time.Instant
-import kotlin.math.max
 import kotlin.math.min
 
 /**
@@ -84,10 +85,14 @@ class CloudManager : CoroutineVerticle() {
     private const val VM_CREATION_LOCK_PREFIX = "CloudManager.VMs.CreationLock."
 
     /**
-     * The maximum number of seconds to backoff between failed attempts to
-     * create a VM
+     * Name of a cluster-wide lock used to run [sync] only once at the same time
      */
-    private const val MAX_BACKOFF_SECONDS = 60 * 60
+    private const val LOCK_SYNC = "CloudManager.Sync.Lock"
+
+    /**
+     * Name of a cluster-wide map to store circuit breaker states
+     */
+    private const val CLUSTER_MAP_CIRCUIT_BREAKERS = "CloudManager.Map.CircuitBreakers"
   }
 
   /**
@@ -123,6 +128,12 @@ class CloudManager : CoroutineVerticle() {
   internal lateinit var setups: List<Setup>
 
   /**
+   * Default creation policy if none is defined in the [Setup]
+   */
+  private lateinit var defaultCreationPolicyRetries: RetryPolicy
+  private var defaultCreationPolicyLockAfterRetries: Long = 0
+
+  /**
    * Registry to save created VMs
    */
   private lateinit var vmRegistry: VMRegistry
@@ -138,33 +149,33 @@ class CloudManager : CoroutineVerticle() {
   private lateinit var setupSelector: SetupSelector
 
   /**
-   * The current number of seconds to wait before the next attempt to create a VM
+   * Circuit breakers for all setups that specify the maximum number of attempts
+   * to create a VM, delays, and whether another attempt can be performed or not
    */
-  private var backoffSeconds = 0
+  private lateinit var setupCircuitBreakers: VMCircuitBreakerMap
 
   /**
-   * The maximum number of seconds the cloud manager should try to log in to a
-   * new VM via SSH
+   * The maximum time the cloud manager should try to log in to a new VM via SSH
    */
-  private var timeoutSshReady: Long = 300L
+  private var timeoutSshReady = Duration.ofMinutes(5)
 
   /**
-   * The maximum number of seconds the cloud manager should wait for a new
-   * agent to become available
+   * The maximum time the cloud manager should wait for a new agent to become
+   * available
    */
-  private var timeoutAgentReady: Long = 300L
+  private var timeoutAgentReady = Duration.ofMinutes(5)
 
   /**
-   * The maximum number of seconds that creating a VM may take before it is
-   * aborted with an error
+   * The maximum time that creating a VM may take before it is aborted with an
+   * error
    */
-  private var timeoutCreateVM: Long = 300L
+  private var timeoutCreateVM = Duration.ofMinutes(5)
 
   /**
-   * The maximum number of seconds that destroying a VM may take before it is
-   * aborted with an error
+   * The maximum time that destroying a VM may take before it is aborted with
+   * an error
    */
-  private var timeoutDestroyVM: Long = 300L
+  private var timeoutDestroyVM = Duration.ofMinutes(5)
 
   override suspend fun start() {
     log.info("Launching cloud manager ...")
@@ -180,13 +191,42 @@ class CloudManager : CoroutineVerticle() {
     poolAgentParams = JsonUtils.mapper.convertValue(
         config.getJsonArray(CLOUD_AGENTPOOL, JsonArray()))
 
-    timeoutSshReady = config.getLong(ConfigConstants.CLOUD_TIMEOUTS_SSHREADY, timeoutSshReady)
-    timeoutAgentReady = config.getLong(ConfigConstants.CLOUD_TIMEOUTS_AGENTREADY, timeoutAgentReady)
-    timeoutCreateVM = config.getLong(ConfigConstants.CLOUD_TIMEOUTS_CREATEVM, timeoutCreateVM)
-    timeoutDestroyVM = config.getLong(ConfigConstants.CLOUD_TIMEOUTS_DESTROYVM, timeoutDestroyVM)
+    timeoutSshReady = config.getString(ConfigConstants.CLOUD_TIMEOUTS_SSHREADY)
+        ?.toDuration() ?: timeoutSshReady
+    timeoutAgentReady = config.getString(ConfigConstants.CLOUD_TIMEOUTS_AGENTREADY)
+        ?.toDuration() ?: timeoutAgentReady
+    timeoutCreateVM = config.getString(ConfigConstants.CLOUD_TIMEOUTS_CREATEVM)
+        ?.toDuration() ?: timeoutCreateVM
+    timeoutDestroyVM = config.getString(ConfigConstants.CLOUD_TIMEOUTS_DESTROYVM)
+        ?.toDuration() ?: timeoutDestroyVM
 
     // load setups file
     setups = SetupRegistryFactory.create(vertx).findSetups()
+
+    // load values of default creation policy
+    // the default values here describe a time frame of 10 minutes in which
+    // at most five attempts will be made to create a VM with a subsequent
+    // lock time of 20 minutes.
+    defaultCreationPolicyRetries = RetryPolicy(
+        maxAttempts = config.getInteger(
+            ConfigConstants.CLOUD_SETUPS_CREATION_RETRIES_MAXATTEMPTS, 5),
+        delay = config.getString(
+            ConfigConstants.CLOUD_SETUPS_CREATION_RETRIES_DELAY)
+            ?.toDuration()?.toMillis() ?: 40_000L, // 40 seconds
+        exponentialBackoff = config.getInteger(
+            ConfigConstants.CLOUD_SETUPS_CREATION_RETRIES_EXPONENTIALBACKOFF, 2),
+        maxDelay = config.getString(
+            ConfigConstants.CLOUD_SETUPS_CREATION_RETRIES_MAXDELAY)
+            ?.toDuration()?.toMillis()
+    )
+    defaultCreationPolicyLockAfterRetries = config.getString(
+        ConfigConstants.CLOUD_SETUPS_CREATION_LOCKAFTERRETRIES)
+        ?.toDuration()?.toMillis() ?: (20 * 60 * 1000L) // 20 minutes
+
+    // initialize cluster map for circuit breakers
+    setupCircuitBreakers = VMCircuitBreakerMap(CLUSTER_MAP_CIRCUIT_BREAKERS,
+        setups, defaultCreationPolicyRetries, defaultCreationPolicyLockAfterRetries,
+        vertx)
 
     // if sshUsername is null, check if all setups have an sshUsername
     if (sshUsername == null) {
@@ -206,19 +246,18 @@ class CloudManager : CoroutineVerticle() {
     // create setup selector
     setupSelector = SetupSelector(vmRegistry, poolAgentParams)
 
-    // keep track of left agents - use local consumer here because
-    // we only need to listen to our own REMOTE_AGENT_LEFT messages
-    vertx.eventBus().localConsumer<String>(REMOTE_AGENT_LEFT) { msg ->
-      val agentId = msg.body().substring(REMOTE_AGENT_ADDRESS_PREFIX.length)
-      log.info("Agent $agentId has left the cluster. Scheduling deletion of its VM ...")
+    // keep track of left cluster nodes
+    vertx.eventBus().consumer<JsonObject>(CLUSTER_NODE_LEFT) { msg ->
+      val agentId = msg.body().getString("agentId")
+      log.info("Cluster node `$agentId' has left the cluster. Scheduling deletion of its VM ...")
       launch {
         vmRegistry.setVMStatus(agentId, VM.Status.RUNNING, VM.Status.LEFT)
       }
     }
-    vertx.eventBus().consumer<String>(REMOTE_AGENT_ADDED) { msg ->
+    vertx.eventBus().consumer(REMOTE_AGENT_ADDED) { msg ->
       // reset the VM status if the agent has returned -- in the hope that the
       // VM has not been deleted by `sync()` in the meantime
-      val agentId = msg.body().substring(REMOTE_AGENT_ADDRESS_PREFIX.length)
+      val agentId = msg.body()
       log.info("Agent $agentId has joined the cluster.")
       launch {
         vmRegistry.setVMStatus(agentId, VM.Status.LEFT, VM.Status.RUNNING)
@@ -257,8 +296,9 @@ class CloudManager : CoroutineVerticle() {
    * Start a periodic timer that synchronizes the VM registry with the Cloud
    */
   private fun syncTimer() {
-    val seconds = config.getLong(ConfigConstants.CLOUD_SYNC_INTERVAL, 120L)
-    vertx.setTimer(1000 * seconds) {
+    val milliseconds = config.getString(ConfigConstants.CLOUD_SYNC_INTERVAL, "2m")
+        .toDuration().toMillis()
+    vertx.setTimer(milliseconds) {
       launch {
         syncTimerStart()
       }
@@ -284,113 +324,139 @@ class CloudManager : CoroutineVerticle() {
    * Synchronize the VM registry with the Cloud
    */
   private suspend fun sync(cleanupOnly: Boolean = false) {
-    log.trace("Syncing VMs ...")
-
-    // destroy all virtual machines whose agents have left
-    val vmsToRemove = vmRegistry.findVMs(VM.Status.LEFT)
-    for (vm in vmsToRemove) {
-      log.info("Destroying VM of left agent `${vm.id}' ...")
-      vmRegistry.forceSetVMStatus(vm.id, VM.Status.DESTROYING)
-      if (vm.externalId != null) {
-        cloudClient.destroyVM(vm.externalId, Duration.ofSeconds(timeoutDestroyVM))
-      }
-      vmRegistry.forceSetVMStatus(vm.id, VM.Status.DESTROYED)
-      vmRegistry.setVMReason(vm.id, "Agent has left the cluster")
-      vmRegistry.setVMDestructionTime(vm.id, Instant.now())
+    val syncLock = try {
+      vertx.sharedData().getLockWithTimeout(LOCK_SYNC, 5000).await()
+    } catch (t: Throwable) {
+      // Someone else in the cluster is current syncing. No need to do it twice
+      log.trace("Another instance is already syncing VMs")
+      return
     }
 
-    // destroy orphaned VMs:
-    // - VMs that we created before but that are not in our registry
-    // - VMs that we created but that do not have an agent and won't get one
-    val existingVMs = cloudClient.listVMs { createdByTag == it[CREATED_BY] }
-    val deleteDeferreds = mutableListOf<Deferred<String>>()
-    for (externalId in existingVMs) {
-      val id = vmRegistry.findVMByExternalId(externalId)?.id
-      val shouldDelete = if (id == null) {
-        // we don't know this VM
-        true
-      } else {
-        val lock = tryLockVM(id)
-        if (lock == null) {
-          // someone else is currently creating the VM
+    try {
+      log.trace("Syncing VMs ...")
+
+      // destroy all virtual machines whose agents have left
+      val vmsToRemove = vmRegistry.findVMs(VM.Status.LEFT)
+      for (vm in vmsToRemove) {
+        log.info("Destroying VM of left agent `${vm.id}' ...")
+        vmRegistry.forceSetVMStatus(vm.id, VM.Status.DESTROYING)
+        if (vm.externalId != null) {
+          cloudClient.destroyVM(vm.externalId, timeoutDestroyVM)
+        }
+        vmRegistry.forceSetVMStatus(vm.id, VM.Status.DESTROYED)
+        vmRegistry.setVMReason(vm.id, "Agent has left the cluster")
+        vmRegistry.setVMDestructionTime(vm.id, Instant.now())
+      }
+
+      // destroy orphaned VMs:
+      // - VMs that we created before but that are not in our registry
+      // - VMs that we created but that do not have an agent and won't get one
+      val existingVMs = cloudClient.listVMs { createdByTag == it[CREATED_BY] }
+      val deleteDeferreds = mutableListOf<Deferred<String>>()
+      for (externalId in existingVMs) {
+        val id = vmRegistry.findVMByExternalId(externalId)?.id
+        val shouldDelete = if (id == null) {
+          // we don't know this VM
+          true
+        } else {
+          val lock = tryLockVM(id)
+          if (lock == null) {
+            // someone else is currently creating the VM
+            false
+          } else {
+            lock.release()
+
+            // No one is currently creating the VM. Delete it if there is no
+            // corresponding agent.
+            !agentRegistry.getAgentIds().contains(id)
+          }
+        }
+
+        if (shouldDelete) {
+          val active = try {
+            cloudClient.isVMActive(externalId)
+          } catch (e: NoSuchElementException) {
+            false
+          }
+          if (active) {
+            deleteDeferreds.add(async {
+              log.info("Found orphaned VM `$externalId' ...")
+              cloudClient.destroyVM(externalId, timeoutDestroyVM)
+              if (id != null) {
+                vmRegistry.forceSetVMStatus(id, VM.Status.DESTROYED)
+                vmRegistry.setVMReason(id, "VM was orphaned")
+                vmRegistry.setVMDestructionTime(id, Instant.now())
+              }
+              externalId
+            })
+          }
+        }
+      }
+      val deletedVMs = deleteDeferreds.awaitAll()
+      val remainingVMs = existingVMs.toSet() - deletedVMs
+
+      // update status of VMs that don't exist anymore
+      val nonTerminatedVMs = vmRegistry.findNonTerminatedVMs()
+      for (nonTerminatedVM in nonTerminatedVMs) {
+        val lock = tryLockVM(nonTerminatedVM.id)
+        val shouldUpdateStatus = if (lock == null) {
+          // someone is currently creating the VM
           false
         } else {
+          // no one is currently creating the VM
           lock.release()
 
-          // No one is currently creating the VM. Delete it if there is no
-          // corresponding agent.
-          !agentRegistry.getAgentIds().contains(id)
+          if (nonTerminatedVM.externalId != null) {
+            // Entry has an external ID. Check if there is a corresponding VM.
+            !existingVMs.contains(nonTerminatedVM.externalId)
+          } else {
+            // Entry has no external ID. It's an orphan.
+            true
+          }
+        }
+
+        if (shouldUpdateStatus) {
+          log.info("Setting status of deleted VM `${nonTerminatedVM.id}' to DESTROYED")
+          vmRegistry.forceSetVMStatus(nonTerminatedVM.id, VM.Status.DESTROYED)
+          vmRegistry.setVMReason(nonTerminatedVM.id, "VM did not exist anymore")
         }
       }
 
-      if (shouldDelete) {
-        val active = try {
-          cloudClient.isVMActive(externalId)
-        } catch (e: NoSuchElementException) {
-          false
+      // delete block devices that are not attached to a VM (anymore) and whose
+      // external VM ID is unknown
+      val unattachedBlockDevices = cloudClient.listAvailableBlockDevices list@{ bd ->
+        if (createdByTag != bd[CREATED_BY]) {
+          // this is not our block device
+          return@list false
         }
-        if (active) {
-          deleteDeferreds.add(async {
-            log.info("Found orphaned VM `$externalId' ...")
-            cloudClient.destroyVM(externalId, Duration.ofSeconds(timeoutDestroyVM))
-            if (id != null) {
-              vmRegistry.forceSetVMStatus(id, VM.Status.DESTROYED)
-              vmRegistry.setVMReason(id, "VM was orphaned")
-              vmRegistry.setVMDestructionTime(id, Instant.now())
-            }
-            externalId
-          })
+
+        val externalId = bd[VM_EXTERNAL_ID]
+        if (externalId != null) {
+          val lock = tryLockVM(externalId) ?:
+              // someone is currently creating the VM to which the block
+              // device will be attached
+              return@list false
+          lock.release()
         }
+
+        externalId == null || !remainingVMs.contains(externalId)
       }
-    }
-    val deletedVMs = deleteDeferreds.awaitAll()
-    val remainingVMs = existingVMs.toSet() - deletedVMs
 
-    // update status of VMs that don't exist anymore
-    val nonTerminatedVMs = vmRegistry.findNonTerminatedVMs()
-    for (nonTerminatedVM in nonTerminatedVMs) {
-      val lock = tryLockVM(nonTerminatedVM.id)
-      val shouldUpdateStatus = if (lock == null) {
-        // someone is currently creating the VM
-        false
-      } else {
-        // no one is currently creating the VM
-        lock.release()
+      unattachedBlockDevices.map { volumeId ->
+        async {
+          log.info("Deleting unattached volume `$volumeId' ...")
+          cloudClient.destroyBlockDevice(volumeId)
+        }
+      }.awaitAll()
 
-        if (nonTerminatedVM.externalId != null) {
-          // Entry has an external ID. Check if there is a corresponding VM.
-          !existingVMs.contains(nonTerminatedVM.externalId)
-        } else {
-          // Entry has no external ID. It's an orphan.
-          true
+      if (!cleanupOnly) {
+        // ensure there's a minimum number of VMs
+        launch {
+          createRemoteAgent { setupSelector.selectMinimum(setups) }
         }
       }
-
-      if (shouldUpdateStatus) {
-        log.info("Setting status of deleted VM `${nonTerminatedVM.id}' to DESTROYED")
-        vmRegistry.forceSetVMStatus(nonTerminatedVM.id, VM.Status.DESTROYED)
-        vmRegistry.setVMReason(nonTerminatedVM.id, "VM did not exist anymore")
-      }
-    }
-
-    // delete block devices that are not attached to a VM (anymore) and whose
-    // external VM ID is unknown
-    val unattachedBlockDevices = cloudClient.listAvailableBlockDevices { bd ->
-      createdByTag == bd[CREATED_BY] && (!bd.containsKey(VM_EXTERNAL_ID) ||
-          !remainingVMs.contains(bd[VM_EXTERNAL_ID]))
-    }
-    unattachedBlockDevices.map { volumeId ->
-      async {
-        log.info("Deleting unattached volume `$volumeId' ...")
-        cloudClient.destroyBlockDevice(volumeId)
-      }
-    }.awaitAll()
-
-    if (!cleanupOnly) {
-      // ensure there's a minimum number of VMs
-      launch {
-        createRemoteAgent { setupSelector.selectMinimum(setups) }
-      }
+    } finally {
+      syncLock.release()
     }
   }
 
@@ -425,7 +491,7 @@ class CloudManager : CoroutineVerticle() {
     val vmsToKeep = mutableListOf<VM>()
     for (setup in minimumSetups) {
       val vms = vmsPerSetup[setup.id]
-      if (vms != null && vms.isNotEmpty()) {
+      if (!vms.isNullOrEmpty()) {
         vmsToKeep.add(vms.removeFirst())
       }
     }
@@ -446,8 +512,9 @@ class CloudManager : CoroutineVerticle() {
    * Start a periodic timer that sends keep-alive messages to remote agents
    */
   private fun sendKeepAliveTimer() {
-    val seconds = config.getLong(ConfigConstants.CLOUD_KEEP_ALIVE_INTERVAL, 30L)
-    vertx.setTimer(1000 * seconds) {
+    val milliseconds = config.getString(ConfigConstants.CLOUD_KEEP_ALIVE_INTERVAL, "30s")
+        .toDuration().toMillis()
+    vertx.setTimer(milliseconds) {
       launch {
         sendKeepAliveTimerStart()
       }
@@ -460,18 +527,20 @@ class CloudManager : CoroutineVerticle() {
    */
   internal suspend fun createRemoteAgent(n: Long, requiredCapabilities: Collection<String>) {
     var remaining = n
-    val goodSetups = setups.toMutableList()
-    while (remaining > 0 && goodSetups.isNotEmpty()) {
-      val result = createRemoteAgent { setupSelector.select(remaining, requiredCapabilities, goodSetups) }
-
-      // remove failed setups (i.e. retain alternatives), then try again
-      remaining = 0
-      for (p in result) {
-        if (!p.second) {
-          remaining++
-          goodSetups.remove(p.first.setup)
-        }
+    while (remaining > 0) {
+      // Remove setups whose circuit breaker is open. We have to do this in
+      // every iteration because the circuit breaker states can change.
+      // 'setupCircuitBreakers' can never have more entries than 'setups' but
+      // we need to query all 'setups'. Copy the whole map to local to avoid
+      // multiple cluster map requests.
+      val cbs = setupCircuitBreakers.getAllBySetup()
+      val possibleSetups = setups.filter { cbs[it.id]?.canPerformAttempt ?: true }
+      if (possibleSetups.isEmpty()) {
+        break
       }
+
+      val result = createRemoteAgent { setupSelector.select(remaining, requiredCapabilities, possibleSetups) }
+      remaining = result.count { !it.second }.toLong()
     }
   }
 
@@ -508,9 +577,10 @@ class CloudManager : CoroutineVerticle() {
         try {
           log.info("Creating virtual machine ${vm.id} with setup `${setup.id}' ...")
 
-          if (backoffSeconds > 10) {
-            log.info("Backing off for $backoffSeconds seconds due to too many failed attempts.")
-            delay(backoffSeconds * 1000L)
+          val delay = setupCircuitBreakers.computeIfAbsent(setup).currentDelay
+          if (delay > 0) {
+            log.info("Backing off for $delay milliseconds due to too many failed attempts.")
+            delay(delay)
           }
 
           try {
@@ -523,7 +593,7 @@ class CloudManager : CoroutineVerticle() {
             val volumeDeferreds = createVolumesAsync(externalId, setup)
 
             try {
-              cloudClient.waitForVM(externalId, Duration.ofSeconds(timeoutCreateVM))
+              cloudClient.waitForVM(externalId, timeoutCreateVM)
 
               val volumeIds = volumeDeferreds.awaitAll()
               for (volumeId in volumeIds) {
@@ -537,7 +607,7 @@ class CloudManager : CoroutineVerticle() {
               provisionVM(ipAddress, vm.id, externalId, setup)
             } catch (e: Throwable) {
               vmRegistry.forceSetVMStatus(vm.id, VM.Status.DESTROYING)
-              cloudClient.destroyVM(externalId, Duration.ofSeconds(timeoutDestroyVM))
+              cloudClient.destroyVM(externalId, timeoutDestroyVM)
               for (vd in volumeDeferreds) {
                 val volumeId = try {
                   vd.await()
@@ -552,12 +622,12 @@ class CloudManager : CoroutineVerticle() {
 
             vmRegistry.setVMStatus(vm.id, VM.Status.PROVISIONING, VM.Status.RUNNING)
             vmRegistry.setVMAgentJoinTime(vm.id, Instant.now())
-            backoffSeconds = 0
+            setupCircuitBreakers.afterAttemptPerformed(setup.id, true)
           } catch (t: Throwable) {
             vmRegistry.forceSetVMStatus(vm.id, VM.Status.ERROR)
             vmRegistry.setVMReason(vm.id, t.message ?: "Unknown error")
             vmRegistry.setVMDestructionTime(vm.id, Instant.now())
-            backoffSeconds = min(MAX_BACKOFF_SECONDS, max(backoffSeconds * 2, 2))
+            setupCircuitBreakers.afterAttemptPerformed(setup.id, false)
             throw t
           }
         } finally {
@@ -583,11 +653,13 @@ class CloudManager : CoroutineVerticle() {
    */
   private suspend fun createVM(id: String, setup: Setup): String {
     val metadata = mapOf(CREATED_BY to createdByTag, SETUP_ID to setup.id)
+    val metadataBlockDevice = metadata + (VM_EXTERNAL_ID to id)
 
     val name = "fraunhofer-steep-${id}"
     val imageId = cloudClient.getImageID(setup.imageName)
     val blockDeviceId = cloudClient.createBlockDevice(setup.blockDeviceSizeGb,
-        setup.blockDeviceVolumeType, imageId, true, setup.availabilityZone, metadata)
+        setup.blockDeviceVolumeType, imageId, true, setup.availabilityZone,
+        metadataBlockDevice)
     try {
       return cloudClient.createVM(name, setup.flavor, blockDeviceId,
           setup.availabilityZone, metadata)
@@ -631,7 +703,7 @@ class CloudManager : CoroutineVerticle() {
     // to become available
     val promise = Promise.promise<Unit>()
     val consumer = vertx.eventBus().consumer<String>(REMOTE_AGENT_ADDED) { msg ->
-      if (msg.body() == REMOTE_AGENT_ADDRESS_PREFIX + vmId) {
+      if (msg.body() == vmId) {
         promise.complete()
       }
     }
@@ -648,7 +720,8 @@ class CloudManager : CoroutineVerticle() {
         "env" to System.getenv(),
         "ipAddress" to ipAddress,
         "agentId" to vmId,
-        "agentCapabilities" to setup.providedCapabilities
+        "agentCapabilities" to setup.providedCapabilities, // TODO deprecated - it's available through `setup` now
+        "setup" to setup
     )
 
     // run provisioning scripts
@@ -656,7 +729,7 @@ class CloudManager : CoroutineVerticle() {
       val destFileName = "/tmp/" + FilenameUtils.getName(script)
 
       // compile script template and write result into temporary file
-      val tmpFile = vertx.executeBlocking<File>({ ebp ->
+      val tmpFile = vertx.executeBlocking({ ebp ->
         val compiledTemplate = engine.getTemplate(script)
         val writer = StringWriter()
         compiledTemplate.evaluate(writer, context)
@@ -685,7 +758,7 @@ class CloudManager : CoroutineVerticle() {
     }
 
     // throw if the agent does not become available after a set amount of time
-    val timeout = 1000L * timeoutAgentReady
+    val timeout = timeoutAgentReady.toMillis()
     val timerId = vertx.setTimer(timeout) {
       promise.fail("Remote agent `$vmId' with IP address `$ipAddress' did " +
           "not become available after $timeout ms")
@@ -709,23 +782,24 @@ class CloudManager : CoroutineVerticle() {
    */
   private suspend fun waitForSSH(ipAddress: String, externalId: String, ssh: SSHClient) {
     val retrySeconds = 2
-    val retries = timeoutSshReady / retrySeconds
+    val deadline = Instant.now().plus(timeoutSshReady)
 
-    for (i in 1L..retries) {
-      cloudClient.waitForVM(externalId, Duration.ofSeconds(timeoutCreateVM))
+    while (true) {
+      cloudClient.waitForVM(externalId, timeoutCreateVM)
 
       log.info("Waiting for SSH: $ipAddress")
 
       try {
         ssh.tryConnect(retrySeconds)
+        break
       } catch (e: IOException) {
-        delay(retrySeconds * 1000L)
-        continue
+        delay(min(deadline.toEpochMilli() - Instant.now().toEpochMilli(),
+            retrySeconds * 1000L))
+        val now = Instant.now()
+        if (now.isAfter(deadline) || now == deadline) {
+          throw IllegalStateException("Too many attempts to connect to SSH")
+        }
       }
-
-      return
     }
-
-    throw IllegalStateException("Too many attempts to connect to SSH")
   }
 }

@@ -33,6 +33,15 @@ const Tooltip = ({ title, delay = 300, forceVisible = undefined, className,
     }
   }, [title, tooltip])
 
+  useEffect(() => {
+    return () => {
+      if (timer.current) {
+        clearTimeout(timer.current)
+        timer.current = undefined
+      }
+    }
+  }, [])
+
   function show() {
     function showNow() {
       if (tooltip === undefined) {
@@ -68,10 +77,14 @@ const Tooltip = ({ title, delay = 300, forceVisible = undefined, className,
       timer.current = undefined
     }
 
-    if (tooltip) {
-      tooltip.destroy()
-      setTooltip(undefined)
-    }
+    // Destroy tooltip in the next event loop tick after setVisible has been
+    // executed. This prevents flickering.
+    setTimeout(() => {
+      if (tooltip) {
+        tooltip.destroy()
+        setTooltip(undefined)
+      }
+    }, 0)
 
     setVisible(false)
   }

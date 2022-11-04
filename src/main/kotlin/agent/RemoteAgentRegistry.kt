@@ -4,22 +4,21 @@ import AddressConstants.CLUSTER_NODE_LEFT
 import AddressConstants.REMOTE_AGENT_ADDED
 import AddressConstants.REMOTE_AGENT_ADDRESS_PREFIX
 import AddressConstants.REMOTE_AGENT_LEFT
+import agent.AgentRegistry.SelectCandidatesParam
+import helper.JsonUtils
 import helper.debounce
+import helper.hazelcast.ClusterMap
 import io.prometheus.client.Gauge
-import io.vertx.core.Future
-import io.vertx.core.Promise
 import io.vertx.core.Vertx
 import io.vertx.core.impl.NoStackTraceThrowable
-import io.vertx.core.json.JsonArray
 import io.vertx.core.json.JsonObject
-import io.vertx.core.shareddata.AsyncMap
 import io.vertx.core.shareddata.LocalMap
 import io.vertx.core.shareddata.Shareable
 import io.vertx.kotlin.core.eventbus.deliveryOptionsOf
 import io.vertx.kotlin.core.json.json
+import io.vertx.kotlin.core.json.jsonObjectOf
 import io.vertx.kotlin.core.json.obj
 import io.vertx.kotlin.coroutines.await
-import io.vertx.kotlin.coroutines.awaitResult
 import io.vertx.kotlin.coroutines.dispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -112,7 +111,7 @@ class RemoteAgentRegistry(private val vertx: Vertx) : AgentRegistry, CoroutineSc
   /**
    * A cluster-wide map keeping IDs of [RemoteAgent]s
    */
-  private val agents: Future<AsyncMap<String, Boolean>>
+  private val agents: ClusterMap<String, Boolean>
 
   init {
     // create shared maps
@@ -121,34 +120,28 @@ class RemoteAgentRegistry(private val vertx: Vertx) : AgentRegistry, CoroutineSc
     agentSequenceCache = sharedData.getLocalMap(LOCAL_AGENT_SEQUENCE_CACHE_NAME)
     agentCapabilitiesCache = sharedData.getLocalMap(LOCAL_AGENT_CAPABILITIES_CACHE_NAME)
     allocatedAgentsCache = sharedData.getLocalMap(LOCAL_ALLOCATED_AGENTS_CACHE_NAME)
-    val agentsPromise = Promise.promise<AsyncMap<String, Boolean>>()
-    sharedData.getAsyncMap(ASYNC_MAP_NAME, agentsPromise)
-    agents = agentsPromise.future()
+    agents = ClusterMap.create(ASYNC_MAP_NAME, vertx)
 
-    // do not register consumers multiple times
+    // do not register listeners and consumers multiple times
     if (localMap.compute(KEY_INITIALIZED) { _, v -> v != null } == false) {
       val reportRemoteAgents = debounce(vertx) {
-        val size = agents.await().size().await()
+        val size = agents.size()
         log.info("New total number of remote agents: $size")
         gaugeAgents.set(size.toDouble())
       }
 
-      // log added agents
-      vertx.eventBus().consumer<String>(REMOTE_AGENT_ADDED) { msg ->
-        log.info("Remote agent `${msg.body()}' has been added.")
-        reportRemoteAgents()
-      }
-
-      // log left agents and remove them from local caches
-      vertx.eventBus().consumer<String>(REMOTE_AGENT_LEFT) { msg ->
-        log.info("Remote agent `${msg.body()}' has left.")
+      val onEntryAdded: (String, Boolean?) -> Unit = { k, _ ->
+        log.info("Remote agent `$k' has been added.")
         reportRemoteAgents()
 
-        val id = msg.body().substring(REMOTE_AGENT_ADDRESS_PREFIX.length)
-        agentSequenceCache.remove(id)
-        agentCapabilitiesCache.remove(id)
-        allocatedAgentsCache.remove(id)
+        // Send REMOTE_AGENT_ADDED message. We only need to deliver it to
+        // local consumers because every node in the cluster has an
+        // EntryAddedListener like this.
+        vertx.eventBus().publish(REMOTE_AGENT_ADDED, k, deliveryOptionsOf(localOnly = true))
       }
+
+      agents.addEntryAddedListener(false, onEntryAdded)
+      agents.addEntryMergedListener(false, onEntryAdded)
 
       // unregister agents whose nodes have left
       vertx.eventBus().localConsumer<JsonObject>(CLUSTER_NODE_LEFT) { msg ->
@@ -160,55 +153,62 @@ class RemoteAgentRegistry(private val vertx: Vertx) : AgentRegistry, CoroutineSc
 
           for (i in 1..instances) {
             val id = if (i == 1) agentId else "$agentId[$i]"
-            // since every node in the cluster receives the CLUSTER_NODE_LEFT
-            // message, we send REMOTE_AGENT_LEFT to local consumers only
-            deregister(id, true)
+            deregister(id)
           }
         }
+      }
+
+      agents.addEntryRemovedListener { k ->
+        agentSequenceCache.remove(k)
+        agentCapabilitiesCache.remove(k)
+        allocatedAgentsCache.remove(k)
+
+        log.info("Remote agent `$k' has left.")
+        reportRemoteAgents()
+
+        // Send REMOTE_AGENT_LEFT message. We only need to deliver it to
+        // local consumers because every node in the cluster has an
+        // EntryRemovedListener like this.
+        vertx.eventBus().publish(REMOTE_AGENT_LEFT, k, deliveryOptionsOf(localOnly = true))
+      }
+
+      val onPartitionLost = debounce(vertx) {
+        // data has been lost in the cluster
+        // clear caches
+        agentSequenceCache.clear()
+        agentCapabilitiesCache.clear()
+        allocatedAgentsCache.clear()
+
+        reportRemoteAgents()
+      }
+
+      agents.addPartitionLostListener {
+        onPartitionLost()
       }
     }
   }
 
   /**
    * Register a remote agent under the given [id] unless there already is
-   * an agent under this [id], in which case the method does nothing. Also
-   * announce the availability of the agent in the cluster under the given
-   * [id].
+   * an agent under this [id], in which case the method does nothing.
    *
    * The agent should already listen to messages on the eventbus address
    * ([REMOTE_AGENT_ADDRESS_PREFIX]` + id`). The agent registry automatically
    * deregisters the agent when the node with the [id] leaves the cluster.
    */
   suspend fun register(id: String) {
-    val address = REMOTE_AGENT_ADDRESS_PREFIX + id
-    agents.await().put(id, true).await()
-    vertx.eventBus().publish(REMOTE_AGENT_ADDED, address)
+    agents.putIfAbsent(id, true)
   }
 
   /**
-   * Remove the remote agent with the given [id] from the registry. If the
-   * given [id] is unknown to the registry, the method does nothing. Also
-   * announce that the agent has left in the cluster.
+   * Remove the remote agent with the given [id] from the registry
    */
   suspend fun deregister(id: String) {
-    deregister(id, false)
-  }
-
-  private suspend fun deregister(id: String, localOnly: Boolean) {
-    val address = REMOTE_AGENT_ADDRESS_PREFIX + id
-    val oldValue = agents.await().remove(id).await()
-    if (oldValue != null) {
-      vertx.eventBus().publish(REMOTE_AGENT_LEFT, address,
-          deliveryOptionsOf(localOnly = localOnly))
-    } else {
-      // make sure metrics are correct
-      gaugeAgents.set(agents.await().size().await().toDouble())
-    }
+    agents.delete(id)
   }
 
   override suspend fun getAgentIds(): Set<String> {
-    val agents = this.agents.await()
-    return awaitResult { agents.keys(it) }
+    return agents.keys()
   }
 
   override suspend fun getPrimaryAgentIds(): Set<String> =
@@ -231,26 +231,16 @@ class RemoteAgentRegistry(private val vertx: Vertx) : AgentRegistry, CoroutineSc
     return result
   }
 
-  override suspend fun selectCandidates(requiredCapabilities: List<Pair<Collection<String>, Long>>):
+  override suspend fun selectCandidates(params: List<SelectCandidatesParam>):
       List<Pair<Collection<String>, String>> {
-    if (requiredCapabilities.isEmpty()) {
+    if (params.isEmpty()) {
       return emptyList()
     }
 
-    // prepare message
-    val msgInquire = json {
-      obj(
-          "action" to "inquire",
-          "requiredCapabilities" to JsonArray(requiredCapabilities.map {
-            json {
-              obj(
-                  "capabilities" to JsonArray(it.first.toList()),
-                  "processChainCount" to it.second
-              )
-            }
-          })
-      )
-    }
+    val msgInquire = jsonObjectOf(
+        "action" to "inquire",
+        "params" to JsonUtils.mapper.convertValue(params, List::class.java)
+    )
 
     // get IDs of agents that are not busy at the moment
     val filteredAgentIds = getAgentIds().filter { !allocatedAgentsCache.contains(it) }
@@ -264,7 +254,7 @@ class RemoteAgentRegistry(private val vertx: Vertx) : AgentRegistry, CoroutineSc
     var lastCandidateSequence = -1L
     val candidatesPerSet = mutableMapOf<Int, MutableList<Pair<String, Long>>>()
     for (agentAndSequence in keys) {
-      if (candidatesPerSet.size == requiredCapabilities.size &&
+      if (candidatesPerSet.size == params.size &&
           agentAndSequence.second >= lastCandidateSequence) {
         // We do not have to inquire the other agents. We already found at
         // least one agent for each required capability set and there will be
@@ -280,13 +270,13 @@ class RemoteAgentRegistry(private val vertx: Vertx) : AgentRegistry, CoroutineSc
       val supportedCapabilities = agentCapabilitiesCache[agent]?.rcs
       if (supportedCapabilities != null) {
         var shouldInquire = false
-        for ((rci, rcs) in requiredCapabilities.withIndex()) {
-          if (candidatesPerSet.containsKey(rci) && agentAndSequence.second >= lastCandidateSequence) {
+        for ((pi, ps) in params.withIndex()) {
+          if (candidatesPerSet.containsKey(pi) && agentAndSequence.second >= lastCandidateSequence) {
             // we already have a candidate for this capability set and this
             // agent's lastSequence would definitely be higher
             continue
           }
-          if (supportedCapabilities.containsAll(rcs.first)) {
+          if (supportedCapabilities.containsAll(ps.requiredCapabilities)) {
             // the agent supports at least one required capabilities set
             shouldInquire = true
             break
@@ -322,9 +312,9 @@ class RemoteAgentRegistry(private val vertx: Vertx) : AgentRegistry, CoroutineSc
 
           // Pretend we already assigned EXACTLY ONE process chain with this
           // capability set to this agent so that other agents maybe chose another set.
-          msgInquire.getJsonArray("requiredCapabilities")
+          msgInquire.getJsonArray("params")
               .getJsonObject(bestRequiredCapabilities)
-              .put("processChainCount", requiredCapabilities[bestRequiredCapabilities].second - 1)
+              .put("count", params[bestRequiredCapabilities].count - 1)
         }
 
         // save capabilities this agent supports if they are included in the response
@@ -347,7 +337,7 @@ class RemoteAgentRegistry(private val vertx: Vertx) : AgentRegistry, CoroutineSc
       // LRU: Select agent with the lowest `lastSequence` because it's the one
       // that has not processed a process chain for the longest time.
       candidates.sortBy { it.second }
-      Pair(requiredCapabilities[i].first, candidates.first().first)
+      Pair(params[i].requiredCapabilities, candidates.first().first)
     }
   }
 

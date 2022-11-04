@@ -18,6 +18,8 @@ module.exports = {
   PROCESS_CHAIN_ERROR_MESSAGE_CHANGED: "steep.submissionRegistry.processChainErrorMessageChanged",
   PROCESS_CHAIN_PROGRESS_CHANGED: "steep.submissionRegistry.processChainProgressChanged",
 
+  CLUSTER_NODE_LEFT: "steep.cluster.nodeLeft",
+
   AGENT_ADDRESS_PREFIX: "steep.remoteAgentRegistry.agent.",
   AGENT_ADDED: "steep.remoteAgentRegistry.agentAdded",
   AGENT_LEFT: "steep.remoteAgentRegistry.agentLeft",

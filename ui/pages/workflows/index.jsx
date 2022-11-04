@@ -1,8 +1,12 @@
 import ListPage from "../../components/layouts/ListPage"
 import ListItem from "../../components/ListItem"
+import Tooltip from "../../components/Tooltip"
 import WorkflowContext from "../../components/workflows/WorkflowContext"
 import { useMemo } from "react"
+import Link from "next/link"
+import { PlusSquare } from "lucide-react"
 import workflowToProgress from "../../components/workflows/workflow-to-progress"
+import styles from "./index.scss"
 
 const FILTERS = [{
   name: "status",
@@ -33,10 +37,20 @@ function WorkflowListItem({ item: workflow }) {
   }, [workflow])
 }
 
-const Workflows = () => (
-  <ListPage title="Workflows" Context={WorkflowContext}
-      ListItem={WorkflowListItem} subjects="workflows" path="workflows"
-      filters={FILTERS} />
-)
+const Workflows = () => {
+  let additionalButtons = <>
+    <Tooltip title="New workflow &hellip;">
+      <Link href="/new/workflow"><a className="plus-button"><PlusSquare /></a></Link>
+    </Tooltip>
+    <style jsx>{styles}</style>
+  </>
+
+  return (
+    <ListPage title="Workflows" Context={WorkflowContext}
+        ListItem={WorkflowListItem} subjects="workflows" path="workflows"
+        filters={FILTERS} search="workflow"
+        additionalButtons={additionalButtons} />
+  )
+}
 
 export default Workflows

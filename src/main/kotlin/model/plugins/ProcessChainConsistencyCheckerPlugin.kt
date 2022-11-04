@@ -1,5 +1,6 @@
 package model.plugins
 
+import com.fasterxml.jackson.annotation.JsonIgnore
 import io.vertx.core.Vertx
 import model.processchain.Executable
 import model.workflow.ExecuteAction
@@ -31,11 +32,13 @@ import kotlin.reflect.full.callSuspend
 data class ProcessChainConsistencyCheckerPlugin(
     override val name: String,
     override val scriptFile: String,
+    override val version: String? = null,
     override val dependsOn: List<String> = emptyList(),
 
     /**
      * The compiled plugin
      */
+    @JsonIgnore
     override val compiledFunction: KFunction<Boolean> = throwPluginNeedsCompile()
 ) : DependentPlugin
 

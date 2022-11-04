@@ -6,6 +6,8 @@ import agent.AgentRegistryFactory
 import com.fasterxml.jackson.module.kotlin.convertValue
 import db.MetadataRegistry
 import db.MetadataRegistryFactory
+import db.PluginRegistry
+import db.PluginRegistryFactory
 import db.SubmissionRegistry
 import db.SubmissionRegistry.ProcessChainStatus
 import db.SubmissionRegistryFactory
@@ -25,6 +27,7 @@ import io.mockk.slot
 import io.mockk.unmockkAll
 import io.vertx.core.Vertx
 import io.vertx.core.buffer.Buffer
+import io.vertx.core.json.JsonArray
 import io.vertx.core.json.JsonObject
 import io.vertx.ext.web.client.WebClient
 import io.vertx.ext.web.client.predicate.ResponsePredicate
@@ -47,6 +50,13 @@ import model.cloud.VM
 import model.metadata.Cardinality
 import model.metadata.Service
 import model.metadata.ServiceParameter
+import model.plugins.InitializerPlugin
+import model.plugins.OutputAdapterPlugin
+import model.plugins.Plugin
+import model.plugins.ProcessChainAdapterPlugin
+import model.plugins.ProcessChainConsistencyCheckerPlugin
+import model.plugins.ProgressEstimatorPlugin
+import model.plugins.RuntimePlugin
 import model.processchain.Argument
 import model.processchain.Executable
 import model.processchain.ProcessChain
@@ -60,9 +70,16 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.extension.ExtendWith
+import search.QueryCompiler
+import search.SearchResult
+import search.Type
 import java.net.ServerSocket
+import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter.ISO_INSTANT
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.regex.Pattern
 
@@ -77,6 +94,7 @@ class HttpEndpointTest {
   private lateinit var agentRegistry: AgentRegistry
   private lateinit var submissionRegistry: SubmissionRegistry
   private lateinit var metadataRegistry: MetadataRegistry
+  private lateinit var pluginRegistry: PluginRegistry
   private lateinit var vmRegistry: VMRegistry
 
   private val setup = Setup(id = "test-setup", flavor = "myflavor",
@@ -102,6 +120,11 @@ class HttpEndpointTest {
     metadataRegistry = mockk()
     mockkObject(MetadataRegistryFactory)
     every { MetadataRegistryFactory.create(any()) } returns metadataRegistry
+
+    // mock plugin registry
+    pluginRegistry = mockk()
+    mockkObject(PluginRegistryFactory)
+    every { PluginRegistryFactory.create() } returns pluginRegistry
 
     // mock VM registry
     vmRegistry = mockk()
@@ -295,11 +318,88 @@ class HttpEndpointTest {
   }
 
   /**
+   * Test that the endpoint returns a list of plugins
+   */
+  @Test
+  fun getPlugins(vertx: Vertx, ctx: VertxTestContext) {
+    val plugins = listOf(
+      InitializerPlugin("InitializerPluginName", "/path", "1.0.0",
+          listOf("fred", "foo", "bar")),
+      OutputAdapterPlugin("OutputAdapterPluginName", "/path", "1.0.0", "dataType"),
+      ProcessChainAdapterPlugin("Name", "/path", "1.0.0",
+          listOf("fred", "foo", "bar")),
+      ProcessChainConsistencyCheckerPlugin("ProcessChainAdapterPluginName",
+          "/path", "1.0.0", listOf("fred", "foo", "bar")),
+      ProgressEstimatorPlugin("ProgressEstimatorPluginName", "/path", "1.0.0",
+          listOf("myService")),
+      RuntimePlugin("RuntimePluginName", "/path", "1.0.0", "myRuntime"),
+    )
+
+    coEvery { pluginRegistry.getAllPlugins() } returns plugins
+
+    val client = WebClient.create(vertx)
+    CoroutineScope(vertx.dispatcher()).launch {
+      ctx.coVerify {
+        val response = client.get(port, "localhost", "/plugins")
+          .`as`(BodyCodec.jsonArray())
+          .expect(ResponsePredicate.SC_OK)
+          .expect(ResponsePredicate.JSON)
+          .send()
+          .await()
+
+        val returnedList = JsonUtils.mapper.convertValue<List<Plugin>>(response.body().list)
+        assertThat(returnedList)
+          .usingRecursiveFieldByFieldElementComparatorIgnoringFields("compiledFunction")
+          .isEqualTo(plugins)
+
+        ctx.completeNow()
+      }
+    }
+  }
+
+  /**
+   * Test that the endpoint returns a single plugin
+   */
+  @Test
+  fun getPluginByName(vertx: Vertx, ctx: VertxTestContext) {
+    val plugins = listOf(
+      InitializerPlugin("InitializerPluginName", "/path", "1.0.0",
+          listOf("fred", "foo", "bar")),
+    )
+
+    coEvery { pluginRegistry.getAllPlugins() } returns plugins
+
+    val client = WebClient.create(vertx)
+    CoroutineScope(vertx.dispatcher()).launch {
+      ctx.coVerify {
+        client.get(port, "localhost", "/plugins/UNKNOWN_NAME")
+          .expect(ResponsePredicate.SC_NOT_FOUND)
+          .send()
+          .await()
+
+        val response = client.get(port, "localhost", "/plugins/InitializerPluginName")
+          .`as`(BodyCodec.jsonObject())
+          .expect(ResponsePredicate.SC_OK)
+          .expect(ResponsePredicate.JSON)
+          .send()
+          .await()
+
+        assertThat(JsonUtils.fromJson<Plugin>(response.body()))
+          .usingRecursiveComparison()
+          .ignoringFieldsMatchingRegexes("compiledFunction")
+          .isEqualTo(plugins[0])
+
+        ctx.completeNow()
+      }
+    }
+  }
+
+  /**
    * Test that the endpoint returns a list of workflows
    */
   @Test
   fun getWorkflows(vertx: Vertx, ctx: VertxTestContext) {
-    val s1 = Submission(workflow = Workflow())
+    val s1 = Submission(workflow = Workflow(), source = "actions: []")
     coEvery { submissionRegistry.countProcessChainsPerStatus(s1.id) } returns mapOf(
         ProcessChainStatus.REGISTERED to 1L,
         ProcessChainStatus.RUNNING to 2L,
@@ -308,7 +408,7 @@ class HttpEndpointTest {
         ProcessChainStatus.SUCCESS to 5L
     )
 
-    val s2 = Submission(workflow = Workflow())
+    val s2 = Submission(workflow = Workflow(), source = "actions: []")
     coEvery { submissionRegistry.countProcessChainsPerStatus(s2.id) } returns mapOf(
         ProcessChainStatus.REGISTERED to 11L,
         ProcessChainStatus.RUNNING to 12L,
@@ -324,11 +424,17 @@ class HttpEndpointTest {
     coEvery { metadataRegistry.findServices() } returns emptyList()
 
     val js1 = JsonUtils.toJson(s1)
+    js1.remove("workflow")
+    js1.remove("source")
     val js2 = JsonUtils.toJson(s2)
+    js2.remove("workflow")
+    js2.remove("source")
     val js3 = JsonUtils.toJson(s3)
+    js3.remove("workflow")
+    js3.remove("source")
 
-    coEvery { submissionRegistry.findSubmissionsRaw(any(), any(), any(), any()) } returns
-        listOf(js1, js2, js3)
+    coEvery { submissionRegistry.findSubmissionsRaw(any(), any(), any(), any(),
+        excludeWorkflows = true, excludeSources = true) } returns listOf(js1, js2, js3)
     coEvery { submissionRegistry.countSubmissions() } returns 3
 
     val client = WebClient.create(vertx)
@@ -390,8 +496,11 @@ class HttpEndpointTest {
    */
   @Test
   fun getWorkflowsByStatus(vertx: Vertx, ctx: VertxTestContext) {
-    val s3 = Submission(workflow = Workflow(), status = Submission.Status.SUCCESS)
+    val s3 = Submission(workflow = Workflow(), status = Submission.Status.SUCCESS,
+        source = "actions: []")
     val js3 = JsonUtils.toJson(s3)
+    js3.remove("workflow")
+    js3.remove("source")
 
     coEvery { submissionRegistry.countProcessChainsPerStatus(s3.id) } returns
         mapOf(ProcessChainStatus.SUCCESS to 1L)
@@ -399,7 +508,7 @@ class HttpEndpointTest {
     coEvery { metadataRegistry.findServices() } returns emptyList()
 
     coEvery { submissionRegistry.findSubmissionsRaw(Submission.Status.SUCCESS,
-        any(), any(), any()) } returns listOf(js3)
+        any(), any(), any(), excludeWorkflows = true, excludeSources = true) } returns listOf(js3)
     coEvery { submissionRegistry.countSubmissions(Submission.Status.SUCCESS) } returns 1
 
     val client = WebClient.create(vertx)
@@ -440,7 +549,8 @@ class HttpEndpointTest {
    */
   @Test
   fun getWorkflowById(vertx: Vertx, ctx: VertxTestContext) {
-    val s1 = Submission(workflow = Workflow(priority = -10))
+    val source = "actions: []"
+    val s1 = Submission(workflow = Workflow(priority = -10), source = source)
     coEvery { submissionRegistry.countProcessChainsPerStatus(s1.id) } returns mapOf(
         ProcessChainStatus.REGISTERED to 1L,
         ProcessChainStatus.RUNNING to 2L,
@@ -481,7 +591,8 @@ class HttpEndpointTest {
                 "failedProcessChains" to 4,
                 "succeededProcessChains" to 5,
                 "totalProcessChains" to 15,
-                "requiredCapabilities" to array()
+                "requiredCapabilities" to array(),
+                "source" to source
             )
         })
       }
@@ -499,20 +610,10 @@ class HttpEndpointTest {
         ExecuteAction(service = "a"),
         ForEachAction(actions = listOf(
             ExecuteAction(service = "b")
-        ), input = Variable(), enumerator = Variable())
-    )))
+        ), input = Variable(), enumerator = Variable()),
+    )), requiredCapabilities = setOf("cap1", "cap2", "cap3"))
     coEvery { submissionRegistry.countProcessChainsPerStatus(s1.id) } returns
         mapOf(ProcessChainStatus.REGISTERED to 1L)
-
-    coEvery { metadataRegistry.findServices() } returns listOf(
-        Service(id = "a", name = "name a", description = "", path = "",
-            runtime = "", parameters = emptyList(),
-            requiredCapabilities = setOf("cap1", "cap2")),
-        Service(id = "b", name = "name b", description = "", path = "",
-            runtime = "", parameters = emptyList(),
-            requiredCapabilities = setOf("cap1", "cap3"))
-    )
-
     coEvery { submissionRegistry.findSubmissionById(s1.id) } returns s1
 
     val client = WebClient.create(vertx)
@@ -641,7 +742,9 @@ class HttpEndpointTest {
    */
   @Test
   fun putWorkflowById(vertx: Vertx, ctx: VertxTestContext) {
-    val s1 = Submission(workflow = Workflow(), status = Submission.Status.RUNNING)
+    val source = "actions: []"
+    val s1 = Submission(workflow = Workflow(), status = Submission.Status.RUNNING,
+        source = source)
 
     coEvery { submissionRegistry.findSubmissionById(s1.id) } returns s1
     coEvery { submissionRegistry.findSubmissionById("UNKNOWN") } returns null
@@ -757,6 +860,8 @@ class HttpEndpointTest {
           obj(
               "id" to s1.id,
               "status" to Submission.Status.RUNNING.toString(),
+              "requiredCapabilities" to array(),
+              "source" to source,
               "runningProcessChains" to 1,
               "cancelledProcessChains" to 2,
               "succeededProcessChains" to 0,
@@ -784,6 +889,8 @@ class HttpEndpointTest {
           obj(
               "id" to s1.id,
               "status" to Submission.Status.RUNNING.toString(),
+              "requiredCapabilities" to array(),
+              "source" to source,
               "runningProcessChains" to 1,
               "cancelledProcessChains" to 2,
               "succeededProcessChains" to 0,
@@ -886,7 +993,7 @@ class HttpEndpointTest {
   }
 
   private fun doPostWorkflow(vertx: Vertx, ctx: VertxTestContext, body: Buffer,
-      expectedWorkflow: Workflow) {
+      expectedWorkflow: Workflow, expectedRequiredCapabilities: List<String> = emptyList()) {
     val submissionSlot = slot<Submission>()
     coEvery { submissionRegistry.addSubmission(capture(submissionSlot)) } answers {
       ctx.verify {
@@ -910,7 +1017,9 @@ class HttpEndpointTest {
           obj(
               "id" to submissionSlot.captured.id,
               "workflow" to JsonUtils.toJson(expectedWorkflow),
-              "status" to Submission.Status.ACCEPTED.toString()
+              "status" to Submission.Status.ACCEPTED.toString(),
+              "requiredCapabilities" to JsonArray(expectedRequiredCapabilities),
+              "source" to body.toString()
           )
         })
       }
@@ -924,6 +1033,7 @@ class HttpEndpointTest {
    */
   @Test
   fun postWorkflow(vertx: Vertx, ctx: VertxTestContext) {
+    coEvery { metadataRegistry.findServices() } returns emptyList()
     val expected = Workflow()
     val buf = Buffer.buffer(JsonUtils.writeValueAsString(expected))
     doPostWorkflow(vertx, ctx, buf, expected)
@@ -934,9 +1044,36 @@ class HttpEndpointTest {
    */
   @Test
   fun postWorkflowYaml(vertx: Vertx, ctx: VertxTestContext) {
+    coEvery { metadataRegistry.findServices() } returns emptyList()
     val expected = Workflow()
     val buf = Buffer.buffer(YamlUtils.mapper.writeValueAsString(expected))
     doPostWorkflow(vertx, ctx, buf, expected)
+  }
+
+  /**
+   * Test that required capabilities are calculated correctly when a
+   * submission is added to the
+   */
+  @Test
+  fun postWorkflowYamlRequiredCapabilities(vertx: Vertx, ctx: VertxTestContext) {
+    coEvery { metadataRegistry.findServices() } returns listOf(
+        Service(id = "a", name = "name a", description = "", path = "",
+            runtime = "", parameters = emptyList(),
+            requiredCapabilities = setOf("cap1", "cap2")),
+        Service(id = "b", name = "name b", description = "", path = "",
+            runtime = "", parameters = emptyList(),
+            requiredCapabilities = setOf("cap1", "cap3"))
+    )
+
+    val expected = Workflow(actions = listOf(
+        ExecuteAction(service = "a"),
+        ForEachAction(actions = listOf(
+            ExecuteAction(service = "b")
+        ), input = Variable(value = "foobar"), enumerator = Variable()),
+    ))
+
+    val buf = Buffer.buffer(YamlUtils.mapper.writeValueAsString(expected))
+    doPostWorkflow(vertx, ctx, buf, expected, listOf("cap1", "cap2", "cap3"))
   }
 
   /**
@@ -2109,4 +2246,340 @@ class HttpEndpointTest {
   @Test
   fun getHealthFailingVms(vertx: Vertx, ctx: VertxTestContext) =
     getHealthWithEnabledRegistries(vertx, ctx, vms = false)
+
+  /**
+   * Test that the search endpoint returns a list of results
+   */
+  @Test
+  fun getSearch(vertx: Vertx, ctx: VertxTestContext) {
+    val id1 = UniqueID.next()
+    val id2 = UniqueID.next()
+    val queryStr = "foo bar"
+    val encodedQuery = URLEncoder.encode(queryStr, StandardCharsets.UTF_8)
+    val query = QueryCompiler.compile(queryStr)
+
+    val serverZoneId = ZoneId.systemDefault()
+    val startTime = LocalDateTime.of(2022, 5, 31, 7, 2).atZone(serverZoneId).toInstant()
+    val endTime = LocalDateTime.of(2022, 5, 31, 8, 10).atZone(serverZoneId).toInstant()
+    val results = listOf(
+        SearchResult(
+            id = id1,
+            type = Type.WORKFLOW,
+            name = "Elvis",
+            requiredCapabilities = setOf("foo", "bar"),
+            status = Submission.Status.SUCCESS.name,
+            startTime = startTime,
+            endTime = endTime
+        ),
+        SearchResult(
+            id = id2,
+            type = Type.PROCESS_CHAIN,
+            status = ProcessChainStatus.ERROR.name
+        )
+    )
+
+    coEvery { submissionRegistry.search(QueryCompiler.compile(""),
+        any(), any(), any()) } returns emptyList()
+    coEvery { submissionRegistry.search(query,
+        size = 10, offset = 0, order = any()) } returns results
+    coEvery { submissionRegistry.search(query,
+        size = 0, offset = 0, order = any()) } returns emptyList()
+
+    coEvery { submissionRegistry.searchCount(QueryCompiler.compile(""),
+        any(), any()) } returns 0L
+    coEvery { submissionRegistry.searchCount(query, Type.WORKFLOW,
+        false) } returns 1L
+    coEvery { submissionRegistry.searchCount(query, Type.PROCESS_CHAIN,
+        false) } returns 1L
+    coEvery { submissionRegistry.searchCount(query, Type.WORKFLOW,
+        true) } returns 2L
+    coEvery { submissionRegistry.searchCount(query, Type.PROCESS_CHAIN,
+        true) } returns 3L
+
+    val client = WebClient.create(vertx)
+    CoroutineScope(vertx.dispatcher()).launch {
+      ctx.coVerify {
+        // return no results
+        val response = client.get(port, "localhost", "/search")
+            .`as`(BodyCodec.jsonObject())
+            .expect(ResponsePredicate.SC_OK)
+            .expect(ResponsePredicate.JSON)
+            .send()
+            .await()
+
+        assertThat(response.headers()["x-page-size"]).isEqualTo("10")
+        assertThat(response.headers()["x-page-offset"]).isEqualTo("0")
+        assertThat(response.headers()["x-page-total"]).isEqualTo("0")
+        assertThat(response.body()).isEqualTo(jsonObjectOf(
+            "counts" to jsonObjectOf(
+                "workflow" to 0L,
+                "processChain" to 0L,
+                "total" to 0L
+            ),
+            "results" to jsonArrayOf()
+        ))
+      }
+
+      val expectedResults = jsonArrayOf(
+          jsonObjectOf(
+              "id" to id1,
+              "type" to "workflow",
+              "name" to "Elvis",
+              "requiredCapabilities" to jsonArrayOf("foo", "bar"),
+              "status" to "SUCCESS",
+              "startTime" to ISO_INSTANT.format(startTime),
+              "endTime" to ISO_INSTANT.format(endTime),
+              "matches" to jsonArrayOf(
+                  jsonObjectOf(
+                      "locator" to "requiredCapabilities",
+                      "fragment" to "foo",
+                      "termMatches" to jsonArrayOf(
+                          jsonObjectOf(
+                              "term" to "foo",
+                              "indices" to jsonArrayOf(0)
+                          )
+                      )
+                  ),
+                  jsonObjectOf(
+                      "locator" to "requiredCapabilities",
+                      "fragment" to "bar",
+                      "termMatches" to jsonArrayOf(
+                          jsonObjectOf(
+                              "term" to "bar",
+                              "indices" to jsonArrayOf(0)
+                          )
+                      )
+                  )
+              )
+          ),
+          jsonObjectOf(
+              "id" to id2,
+              "type" to "processChain",
+              "requiredCapabilities" to jsonArrayOf(),
+              "status" to "ERROR",
+              "matches" to jsonArrayOf()
+          )
+      )
+
+      ctx.coVerify {
+        val response = client.get(port, "localhost", "/search?q=$encodedQuery")
+            .`as`(BodyCodec.jsonObject())
+            .expect(ResponsePredicate.SC_OK)
+            .expect(ResponsePredicate.JSON)
+            .send()
+            .await()
+
+        assertThat(response.headers()["x-page-size"]).isEqualTo("10")
+        assertThat(response.headers()["x-page-offset"]).isEqualTo("0")
+        assertThat(response.headers()["x-page-total"]).isEqualTo("2")
+        assertThat(response.body()).isEqualTo(jsonObjectOf(
+            "counts" to jsonObjectOf(
+                "workflow" to 1L,
+                "processChain" to 1L,
+                "total" to 2L
+            ),
+            "results" to expectedResults
+        ))
+      }
+
+      ctx.coVerify {
+        client.get(port, "localhost", "/search?q=$encodedQuery&count=invalid")
+            .expect(ResponsePredicate.SC_BAD_REQUEST)
+            .send()
+            .await()
+      }
+
+      ctx.coVerify {
+        val response = client.get(port, "localhost",
+              "/search?q=$encodedQuery&count=none")
+            .`as`(BodyCodec.jsonObject())
+            .expect(ResponsePredicate.SC_OK)
+            .expect(ResponsePredicate.JSON)
+            .send()
+            .await()
+
+        assertThat(response.headers()["x-page-size"]).isEqualTo("10")
+        assertThat(response.headers()["x-page-offset"]).isEqualTo("0")
+        assertThat(response.headers()["x-page-total"]).isNull()
+        assertThat(response.body()).isEqualTo(jsonObjectOf(
+            "results" to expectedResults
+        ))
+      }
+
+      ctx.coVerify {
+        val response = client.get(port, "localhost",
+              "/search?q=$encodedQuery&count=none&size=0")
+            .`as`(BodyCodec.jsonObject())
+            .expect(ResponsePredicate.SC_OK)
+            .expect(ResponsePredicate.JSON)
+            .send()
+            .await()
+
+        assertThat(response.headers()["x-page-size"]).isEqualTo("0")
+        assertThat(response.headers()["x-page-offset"]).isEqualTo("0")
+        assertThat(response.headers()["x-page-total"]).isNull()
+        assertThat(response.body()).isEqualTo(jsonObjectOf(
+            "results" to jsonArrayOf()
+        ))
+      }
+
+      ctx.coVerify {
+        val response = client.get(port, "localhost",
+              "/search?q=$encodedQuery&count=estimate&size=0")
+            .`as`(BodyCodec.jsonObject())
+            .expect(ResponsePredicate.SC_OK)
+            .expect(ResponsePredicate.JSON)
+            .send()
+            .await()
+
+        assertThat(response.headers()["x-page-size"]).isEqualTo("0")
+        assertThat(response.headers()["x-page-offset"]).isEqualTo("0")
+        assertThat(response.headers()["x-page-total"]).isEqualTo("5")
+        assertThat(response.body()).isEqualTo(jsonObjectOf(
+            "counts" to jsonObjectOf(
+                "workflow" to 2L,
+                "processChain" to 3L,
+                "total" to 5L
+            ),
+            "results" to jsonArrayOf()
+        ))
+      }
+
+      ctx.coVerify {
+        val response = client.get(port, "localhost",
+              "/search?q=$encodedQuery&count=exact&size=0")
+            .`as`(BodyCodec.jsonObject())
+            .expect(ResponsePredicate.SC_OK)
+            .expect(ResponsePredicate.JSON)
+            .send()
+            .await()
+
+        assertThat(response.headers()["x-page-size"]).isEqualTo("0")
+        assertThat(response.headers()["x-page-offset"]).isEqualTo("0")
+        assertThat(response.headers()["x-page-total"]).isEqualTo("2")
+        assertThat(response.body()).isEqualTo(jsonObjectOf(
+            "counts" to jsonObjectOf(
+                "workflow" to 1L,
+                "processChain" to 1L,
+                "total" to 2L
+            ),
+            "results" to jsonArrayOf()
+        ))
+      }
+
+      ctx.completeNow()
+    }
+  }
+
+  /**
+   * Test that the search endpoint returns a list of results according to a
+   * given time zone
+   */
+  @Test
+  fun getSearchTimeZone(vertx: Vertx, ctx: VertxTestContext) {
+    val id1 = UniqueID.next()
+
+    val serverZoneId = ZoneId.of("Europe/Berlin")
+    val startTime = LocalDateTime.of(2022, 5, 31, 7, 2).atZone(serverZoneId).toInstant()
+    val endTime = LocalDateTime.of(2022, 5, 31, 8, 10).atZone(serverZoneId).toInstant()
+    val results = listOf(
+        SearchResult(
+            id = id1,
+            type = Type.WORKFLOW,
+            status = Submission.Status.SUCCESS.name,
+            startTime = startTime,
+            endTime = endTime
+        )
+    )
+
+    val query = "2022-05-31T07:02"
+    coEvery { submissionRegistry.search(QueryCompiler.compile(query,
+        serverZoneId), any(), any(), any()) } returns results
+    coEvery { submissionRegistry.searchCount(QueryCompiler.compile(query,
+        serverZoneId), Type.WORKFLOW, any()) } returns 1L
+    coEvery { submissionRegistry.searchCount(QueryCompiler.compile(query,
+        serverZoneId), Type.PROCESS_CHAIN, any()) } returns 0L
+    coEvery { submissionRegistry.search(QueryCompiler.compile(query,
+        ZoneId.of("America/Vancouver")), any(), any(), any()) } returns emptyList()
+    coEvery { submissionRegistry.searchCount(QueryCompiler.compile(query,
+        ZoneId.of("America/Vancouver")), any(), any()) } returns 0L
+
+    val client = WebClient.create(vertx)
+    CoroutineScope(vertx.dispatcher()).launch {
+      val expectedResults = jsonArrayOf(
+          jsonObjectOf(
+              "id" to id1,
+              "type" to "workflow",
+              "status" to "SUCCESS",
+              "requiredCapabilities" to jsonArrayOf(),
+              "startTime" to ISO_INSTANT.format(startTime),
+              "endTime" to ISO_INSTANT.format(endTime),
+              "matches" to jsonArrayOf(
+                  jsonObjectOf(
+                      "locator" to "startTime",
+                      "fragment" to ISO_INSTANT.format(startTime),
+                      "termMatches" to jsonArrayOf(
+                          jsonObjectOf(
+                              "term" to query
+                          )
+                      )
+                  )
+              )
+          )
+      )
+
+      ctx.coVerify {
+        val response = client.get(port, "localhost",
+            "/search?q=$query&timeZone=Europe/Berlin")
+            .`as`(BodyCodec.jsonObject())
+            .expect(ResponsePredicate.SC_OK)
+            .expect(ResponsePredicate.JSON)
+            .send()
+            .await()
+
+        assertThat(response.headers()["x-page-size"]).isEqualTo("10")
+        assertThat(response.headers()["x-page-offset"]).isEqualTo("0")
+        assertThat(response.headers()["x-page-total"]).isEqualTo("1")
+        assertThat(response.body()).isEqualTo(jsonObjectOf(
+            "counts" to jsonObjectOf(
+                "workflow" to 1L,
+                "processChain" to 0L,
+                "total" to 1L
+            ),
+            "results" to expectedResults
+        ))
+      }
+
+      ctx.coVerify {
+        val response = client.get(port, "localhost",
+            "/search?q=$query&timeZone=America/Vancouver")
+            .`as`(BodyCodec.jsonObject())
+            .expect(ResponsePredicate.SC_OK)
+            .expect(ResponsePredicate.JSON)
+            .send()
+            .await()
+
+        assertThat(response.headers()["x-page-size"]).isEqualTo("10")
+        assertThat(response.headers()["x-page-offset"]).isEqualTo("0")
+        assertThat(response.headers()["x-page-total"]).isEqualTo("0")
+        assertThat(response.body()).isEqualTo(jsonObjectOf(
+            "counts" to jsonObjectOf(
+                "workflow" to 0L,
+                "processChain" to 0L,
+                "total" to 0L
+            ),
+            "results" to jsonArrayOf()
+        ))
+      }
+
+      ctx.coVerify {
+        client.get(port, "localhost", "/search?q=$query&timeZone=invalid")
+            .expect(ResponsePredicate.SC_BAD_REQUEST)
+            .send()
+            .await()
+      }
+
+      ctx.completeNow()
+    }
+  }
 }

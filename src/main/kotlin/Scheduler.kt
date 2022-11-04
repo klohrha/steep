@@ -1,3 +1,4 @@
+import AddressConstants.CLUSTER_LIFECYCLE_MERGED
 import AddressConstants.CLUSTER_NODE_LEFT
 import AddressConstants.REMOTE_AGENT_ADDRESS_PREFIX
 import AddressConstants.REMOTE_AGENT_MISSING
@@ -10,6 +11,7 @@ import ConfigConstants.SCHEDULER_LOOKUP_ORPHANS_INITIAL_DELAY
 import ConfigConstants.SCHEDULER_LOOKUP_ORPHANS_INTERVAL
 import agent.Agent
 import agent.AgentRegistry
+import agent.AgentRegistry.SelectCandidatesParam
 import agent.AgentRegistryFactory
 import db.SubmissionRegistry
 import db.SubmissionRegistry.ProcessChainStatus.CANCELLED
@@ -18,6 +20,8 @@ import db.SubmissionRegistry.ProcessChainStatus.REGISTERED
 import db.SubmissionRegistry.ProcessChainStatus.RUNNING
 import db.SubmissionRegistry.ProcessChainStatus.SUCCESS
 import db.SubmissionRegistryFactory
+import helper.debounce
+import helper.toDuration
 import io.prometheus.client.Gauge
 import io.vertx.core.Promise
 import io.vertx.core.json.JsonArray
@@ -31,10 +35,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import model.processchain.ProcessChain
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.concurrent.CancellationException
+import kotlin.math.max
 
 /**
  * The scheduler fetches process chains from a [SubmissionRegistry], executes
@@ -68,13 +75,6 @@ class Scheduler : CoroutineVerticle() {
   private var periodicLookupOrphansJob: Job? = null
 
   /**
-   * A list of sets of capabilities required by process chains with the status
-   * [REGISTERED] and the respective number of process chains
-   */
-  private var allRequiredCapabilities: MutableList<Pair<Collection<String>, Long>> = mutableListOf()
-  private var allRequiredCapabilitiesInitialized = false
-
-  /**
    * The remaining number of lookups to do in [lookup]
    */
   private var pendingLookups = 0L
@@ -82,7 +82,7 @@ class Scheduler : CoroutineVerticle() {
   /**
    * IDs of all process chains we are currently executing
    */
-  private val runningProcessChainIds = mutableSetOf<String>()
+  private val runningProcessChainIds = RunningProcessChainsSet()
 
   /**
    * A cluster-wide map keeping IDs of [Scheduler] instances
@@ -120,16 +120,19 @@ class Scheduler : CoroutineVerticle() {
     agentRegistry = AgentRegistryFactory.create(vertx)
 
     // read configuration
-    val lookupInterval = config.getLong(SCHEDULER_LOOKUP_INTERVAL, 20000L)
-    val lookupOrphansInterval = config.getLong(SCHEDULER_LOOKUP_ORPHANS_INTERVAL, 300_000L)
-    val lookupOrphansInitialDelay = config.getLong(SCHEDULER_LOOKUP_ORPHANS_INITIAL_DELAY, 0L)
+    val lookupInterval = config.getString(SCHEDULER_LOOKUP_INTERVAL, "20s")
+        .toDuration().toMillis()
+    val lookupOrphansInterval = config.getString(SCHEDULER_LOOKUP_ORPHANS_INTERVAL, "5m")
+        .toDuration().toMillis()
+    val lookupOrphansInitialDelay = config.getString(SCHEDULER_LOOKUP_ORPHANS_INITIAL_DELAY, "0s")
+        .toDuration().toMillis()
 
     // periodically look for new process chains and execute them
     periodicLookupJob = launch {
       while (true) {
         delay(lookupInterval)
         try {
-          lookup(updateRequiredCapabilities = true)
+          lookup()
         } catch (t: Throwable) {
           log.error("Failed to look for process chains", t)
         }
@@ -138,9 +141,8 @@ class Scheduler : CoroutineVerticle() {
 
     vertx.eventBus().consumer<JsonObject?>(SCHEDULER_LOOKUP_NOW) { msg ->
       val maxLookups = msg.body()?.getInteger("maxLookups") ?: Int.MAX_VALUE
-      val updateRequiredCapabilities = msg.body()?.getBoolean("updateRequiredCapabilities") ?: true
       launch {
-        lookup(maxLookups, updateRequiredCapabilities)
+        lookup(maxLookups)
       }
     }
 
@@ -153,7 +155,9 @@ class Scheduler : CoroutineVerticle() {
     val addressRunningProcessChains =
         "$SCHEDULER_PREFIX$agentId$SCHEDULER_RUNNING_PROCESS_CHAINS_SUFFIX"
     vertx.eventBus().consumer<Any?>(addressRunningProcessChains) { msg ->
-      msg.reply(JsonArray(runningProcessChainIds.toList()))
+      launch {
+        msg.reply(JsonArray(runningProcessChainIds.getAll()))
+      }
     }
 
     if (lookupOrphansInitialDelay > 0) {
@@ -175,6 +179,12 @@ class Scheduler : CoroutineVerticle() {
     sharedData.getAsyncMap(ASYNC_MAP_NAME, schedulersPromise)
     schedulers = schedulersPromise.future().await()
 
+    val register = suspend {
+      schedulers.put(agentId, true).await()
+    }
+    val debouncedRegister = debounce(vertx) { register() }
+    val debouncedLookupOrphans = debounce(vertx) { lookupOrphans() }
+
     // unregister schedulers whose nodes have left
     vertx.eventBus().localConsumer<JsonObject>(CLUSTER_NODE_LEFT) { msg ->
       launch {
@@ -182,13 +192,25 @@ class Scheduler : CoroutineVerticle() {
         log.trace("Node `$theirAgentId' has left the cluster. Removing scheduler.")
         schedulers.remove(theirAgentId).await()
 
+        // safeguard to make sure our instance is always in the list even if
+        // data in the cluster is lost
+        debouncedRegister()
+
         // look for orphaned process chains the scheduler might have left behind
-        lookupOrphans()
+        debouncedLookupOrphans()
+      }
+    }
+
+    // safeguard to make sure our instance is always in the list even if
+    // data in the cluster is lost
+    vertx.eventBus().localConsumer<Unit>(CLUSTER_LIFECYCLE_MERGED) {
+      launch {
+        register()
       }
     }
 
     // register our own instance in the map
-    schedulers.put(agentId, true).await()
+    register()
   }
 
   /**
@@ -218,14 +240,42 @@ class Scheduler : CoroutineVerticle() {
     schedulers.remove(agentId).await()
   }
 
+  private suspend fun findProcessChainRequiredCapabilities(): List<SelectCandidatesParam> {
+    val rcs = submissionRegistry.findProcessChainRequiredCapabilities(REGISTERED)
+
+    // sort sets by priority
+    val sorted = rcs.sortedWith(
+        compareBy<Pair<Collection<String>, IntRange>> { it.second.last /* max priority */ }
+            .thenBy { it.second.first /* min priority */ }
+    )
+
+    // count process chains for each required capability set and non-overlapping
+    // priority ranges
+    val result = mutableListOf<SelectCandidatesParam>()
+    var lastMaxPriority = Int.MIN_VALUE
+    for ((rc, priorities) in sorted) {
+      val minPriority = max(priorities.first, lastMaxPriority)
+      val maxPriority = priorities.last
+      val count = if (minPriority <= maxPriority) {
+        submissionRegistry.countProcessChains(status = REGISTERED,
+            requiredCapabilities = rc, minPriority = minPriority)
+      } else {
+        0L
+      }
+      if (count > 0L) {
+        result.add(SelectCandidatesParam(rc, minPriority, maxPriority, count))
+      }
+      lastMaxPriority = maxPriority
+    }
+
+    return result
+  }
+
   /**
    * Get registered process chains and execute them asynchronously
    * @param maxLookups the maximum number of lookups to perform
-   * @param updateRequiredCapabilities `true` if the list of known required
-   * capabilities should be updated before performing the lookup
    */
-  private suspend fun lookup(maxLookups: Int = Int.MAX_VALUE,
-      updateRequiredCapabilities: Boolean) {
+  private suspend fun lookup(maxLookups: Int = Int.MAX_VALUE) {
     // increase number of pending lookups and then check if we actually need
     // to proceed here
     val oldPendingLookups = pendingLookups
@@ -236,21 +286,12 @@ class Scheduler : CoroutineVerticle() {
     }
 
     try {
-      if (updateRequiredCapabilities || !allRequiredCapabilitiesInitialized) {
-        val arcs = submissionRegistry.findProcessChainRequiredCapabilities(REGISTERED)
-
-        // count process chains for each required capability set
-        allRequiredCapabilities = arcs.map { rc ->
-          rc to submissionRegistry.countProcessChains(status = REGISTERED,
-              requiredCapabilities = rc)
-        }.toMutableList()
-        allRequiredCapabilitiesInitialized = true
-      }
+      val allRequiredCapabilities = findProcessChainRequiredCapabilities().toMutableList()
 
       while (pendingLookups > 0L) {
         val start = System.currentTimeMillis()
 
-        val allocatedProcessChains = lookupStep()
+        val allocatedProcessChains = lookupStep(allRequiredCapabilities)
 
         if (allocatedProcessChains == 0) {
           // all agents are busy
@@ -275,17 +316,17 @@ class Scheduler : CoroutineVerticle() {
    * One step in the scheduling process controlled by [lookup]. Returns the
    * number of process chains successfully allocated to an agent.
    */
-  private suspend fun lookupStep(): Int {
+  private suspend fun lookupStep(allRequiredCapabilities: MutableList<SelectCandidatesParam>): Int {
     // send all known required capabilities to all agents and ask them if they
     // are available and, if so, what required capabilities they can handle
-    val candidates = selectCandidates()
+    val candidates = selectCandidates(allRequiredCapabilities)
     if (candidates.isEmpty()) {
       // Agents are all busy or do not accept our required capabilities.
       // Check if we need to request a new agent.
       val rcsi = allRequiredCapabilities.iterator()
       while (rcsi.hasNext()) {
         val rcs = rcsi.next()
-        if (!submissionRegistry.existsProcessChain(REGISTERED, rcs.first)) {
+        if (!submissionRegistry.existsProcessChain(REGISTERED, rcs.requiredCapabilities)) {
           // if there is no such process chain, the capabilities are not
           // required anymore
           rcsi.remove()
@@ -294,8 +335,8 @@ class Scheduler : CoroutineVerticle() {
           // capabilities
           val msg = json {
             obj(
-                "n" to rcs.second,
-                "requiredCapabilities" to JsonArray(rcs.first.toList())
+                "n" to rcs.count,
+                "requiredCapabilities" to JsonArray(rcs.requiredCapabilities.toList())
             )
           }
           vertx.eventBus().publish(REMOTE_AGENT_MISSING, msg)
@@ -307,10 +348,19 @@ class Scheduler : CoroutineVerticle() {
     // iterate through all agents that indicated they are available
     var allocatedProcessChains = 0
     for ((requiredCapabilities, address) in candidates) {
-      val arci = allRequiredCapabilities.indexOfFirst { it.first == requiredCapabilities }
+      val arci = allRequiredCapabilities.indexOfFirst { it.requiredCapabilities == requiredCapabilities }
+      val minPriority = if (arci >= 0) allRequiredCapabilities[arci].minPriority else null
 
-      // get next registered process chain for the given set of required capabilities
-      val (processChain, isProcessChainResumed) = fetchNextProcessChain(address, requiredCapabilities)
+      // Get next registered process chain for the given set of required capabilities.
+      // Fetching the process chain and adding it to 'runningProcessChainIds' must
+      // happen atomically. Otherwise, the process chain will be marked as RUNNING
+      // for a short time while no scheduler is executing it yet and a concurrent
+      // call to `lookupOrphans` (in this exact period of time) will consider
+      // the process chain orphaned and schedule it twice.
+      val (processChain, isProcessChainResumed) = runningProcessChainIds.compute {
+        val r = fetchNextProcessChain(address, requiredCapabilities, minPriority)
+        r.first?.id to r
+      }
       if (processChain == null) {
         // We didn't find a process chain for these required capabilities.
         // Remove them from the list of known ones.
@@ -335,17 +385,20 @@ class Scheduler : CoroutineVerticle() {
         submissionRegistry.setProcessChainStatus(processChain.id, REGISTERED)
 
         // continue with the next capability set and candidate
+        runningProcessChainIds.remove(processChain.id)
         continue
       }
 
       log.info("Assigned process chain `${processChain.id}' to agent `${agent.id}'")
       allocatedProcessChains++
-      runningProcessChainIds.add(processChain.id)
 
       // update number of remaining process chains for this required capability set
       if (arci >= 0) {
         val rc = allRequiredCapabilities[arci]
-        allRequiredCapabilities[arci] = rc.copy(second = (rc.second - 1).coerceAtLeast(0))
+        allRequiredCapabilities[arci] = rc.copy(count = (rc.count - 1).coerceAtLeast(0))
+        if (allRequiredCapabilities[arci].count == 0L) {
+          allRequiredCapabilities.removeAt(arci)
+        }
       }
 
       // execute process chain
@@ -382,8 +435,7 @@ class Scheduler : CoroutineVerticle() {
             // try to lookup next process chain immediately
             vertx.eventBus().send(SCHEDULER_LOOKUP_NOW, json {
               obj(
-                  "maxLookups" to 1,
-                  "updateRequiredCapabilities" to false
+                  "maxLookups" to 1
               )
             })
           }
@@ -399,7 +451,8 @@ class Scheduler : CoroutineVerticle() {
    * [processChainsToResume] or by forwarding the request to
    * [AgentRegistry.selectCandidates].
    */
-  private suspend fun selectCandidates(): List<Pair<Collection<String>, String>> {
+  private suspend fun selectCandidates(allRequiredCapabilities: List<SelectCandidatesParam>):
+      List<Pair<Collection<String>, String>> {
     if (processChainsToResume.isNotEmpty()) {
       return processChainsToResume.map { entry ->
         val agentInfo = entry.second
@@ -420,7 +473,7 @@ class Scheduler : CoroutineVerticle() {
    * and a flag specifying if the process chain is resumed or not.
    */
   private suspend fun fetchNextProcessChain(agentAddress: String,
-      requiredCapabilities: Collection<String>): Pair<ProcessChain?, Boolean> {
+      requiredCapabilities: Collection<String>, minPriority: Int?): Pair<ProcessChain?, Boolean> {
     if (processChainsToResume.isNotEmpty()) {
       val pci = processChainsToResume.indexOfFirst { pair ->
         val agentId = pair.second.getString("id")
@@ -435,7 +488,7 @@ class Scheduler : CoroutineVerticle() {
     }
 
     return submissionRegistry.fetchNextProcessChain(
-        REGISTERED, RUNNING, requiredCapabilities) to false
+        REGISTERED, RUNNING, requiredCapabilities, minPriority) to false
   }
 
   /**
@@ -458,13 +511,19 @@ class Scheduler : CoroutineVerticle() {
 
       // ask all scheduler instances which process chains they are currently executing
       val allRunningProcessChains = mutableSetOf<String>()
+      allRunningProcessChains.addAll(runningProcessChainIds.getAll()) // always consider our own process chains
       val keysPromise = Promise.promise<Set<String>>()
       schedulers.keys(keysPromise)
       for (scheduler in keysPromise.future().await()) {
-        val address = "$SCHEDULER_PREFIX$scheduler$SCHEDULER_RUNNING_PROCESS_CHAINS_SUFFIX"
-        val ids = vertx.eventBus().request<JsonArray>(address, null).await()
-        for (id in ids.body()) {
-          allRunningProcessChains.add(id.toString())
+        if (scheduler == agentId) {
+          // no need to send a message to `this` (we've already added
+          // `runningProcessChainIds` to `allRunningProcessChains` above)
+        } else {
+          val address = "$SCHEDULER_PREFIX$scheduler$SCHEDULER_RUNNING_PROCESS_CHAINS_SUFFIX"
+          val ids = vertx.eventBus().request<JsonArray>(address, null).await()
+          for (id in ids.body()) {
+            allRunningProcessChains.add(id.toString())
+          }
         }
       }
 
@@ -531,13 +590,49 @@ class Scheduler : CoroutineVerticle() {
       // resume process chains with agents in `lookup` method
       processChainsToResume.addAll(orphansWithAgents)
       launch {
-        lookup(updateRequiredCapabilities = false)
+        lookup()
       }
     } catch (t: Throwable) {
       // Just log errors but don't treat them any further. Just wait until the
       // next lookup and then try again. We should only resume process chains
       // if everything runs through without any problems.
       log.error("Failed to resume orphaned process chains", t)
+    }
+  }
+
+  /**
+   * A small wrapper around [MutableSet] that provides atomic compute, remove
+   * and getAll operations. This is necessary because fetching a process
+   * chain from the registry and adding it to [runningProcessChainIds] must
+   * happen atomically so that no concurrent call to [lookupOrphans] considers
+   * the process chain orphaned just because it's marked as RUNNING in the
+   * registry but has not been added to the set yet.
+   */
+  private class RunningProcessChainsSet {
+    private val set = mutableSetOf<String>()
+    private val mutex = Mutex()
+
+    suspend fun <T> compute(block: suspend () -> Pair<String?, T>): T {
+      return mutex.withLock {
+        val r = block()
+        val id = r.first
+        if (id != null) {
+          set.add(id)
+        }
+        r.second
+      }
+    }
+
+    suspend fun getAll(): List<String> {
+      return mutex.withLock {
+        set.toList()
+      }
+    }
+
+    suspend fun remove(id: String) {
+      mutex.withLock {
+        set.remove(id)
+      }
     }
   }
 }

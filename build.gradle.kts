@@ -1,11 +1,14 @@
 import java.text.SimpleDateFormat
 import java.util.Date
+import com.github.benmanes.gradle.versions.updates.DependencyUpdatesTask
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
     application
     jacoco
-    kotlin("jvm") version "1.6.21"
+    kotlin("jvm") version "1.7.20"
+    id("com.github.ben-manes.versions") version "0.43.0"
+    id("se.patrikerdes.use-latest-versions") version "0.2.18"
 }
 
 buildscript {
@@ -15,14 +18,14 @@ buildscript {
 }
 
 group = "de.fhg.igd"
-version = "6.0.0-SNAPSHOT"
+version = "6.4.0"
 
-val vertxVersion by extra("4.3.0")
-val prometheusClientVersion by extra("0.15.0")
-val slf4jVersion by extra("1.7.32")
-val logbackVersion by extra("1.2.10")
-val junitVersion by extra("5.8.2")
-val testcontainersVersion by extra("1.16.3")
+val vertxVersion by extra("4.3.4")
+val prometheusClientVersion by extra("0.16.0")
+val slf4jVersion by extra("2.0.3")
+val logbackVersion by extra("1.4.4")
+val junitVersion by extra("5.9.1")
+val testcontainersVersion by extra("1.17.5")
 val kubernetes_dsl_version by extra("3.2.0")
 val kubernetes_client_version by extra("6.0.0")
 val kotlin_hello_version by extra("1.3.1")
@@ -42,7 +45,7 @@ dependencies {
     implementation("ch.qos.logback:logback-core:$logbackVersion")
     implementation("ch.qos.logback.contrib:logback-jackson:0.1.5")
     implementation("ch.qos.logback.contrib:logback-json-classic:0.1.5")
-    implementation("org.codehaus.janino:janino:3.1.7") // for conditionals in logback.xml
+    implementation("org.codehaus.janino:janino:3.1.8") // for conditionals in logback.xml
 
     implementation("io.vertx:vertx-core:$vertxVersion")
     implementation("io.vertx:vertx-hazelcast:$vertxVersion")
@@ -57,29 +60,30 @@ dependencies {
 
     implementation("commons-codec:commons-codec:1.15")
     implementation("commons-io:commons-io:2.11.0")
-    implementation("com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.13.2")
-    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.2")
-    implementation("com.github.luben:zstd-jni:1.5.2-2")
+    implementation("com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.13.4")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.4")
+    implementation("com.github.luben:zstd-jni:1.5.2-5")
     implementation("com.github.zafarkhaja:java-semver:0.9.0")
     implementation("com.google.guava:guava:31.1-jre")
     implementation("com.zaxxer:HikariCP:5.0.1")
     implementation("io.airlift:aircompressor:0.21")
-    implementation("io.pebbletemplates:pebble:3.1.5")
-    implementation("io.projectreactor:reactor-core:3.4.18") // necessary for reactive MongoDB driver
+    implementation("io.pebbletemplates:pebble:3.1.6")
+    implementation("io.projectreactor:reactor-core:3.4.24") // necessary for reactive MongoDB driver
     implementation("io.prometheus:simpleclient:$prometheusClientVersion")
-    implementation("io.micrometer:micrometer-registry-prometheus:1.9.0")
+    implementation("io.micrometer:micrometer-registry-prometheus:1.9.5")
     implementation("org.apache.ant:ant:1.10.12")
     implementation("org.apache.commons:commons-lang3:3.12.0")
-    implementation("org.apache.commons:commons-text:1.9")
-    implementation("org.flywaydb:flyway-core:8.5.10")
-    implementation("org.mongodb:mongodb-driver-reactivestreams:4.6.0")
+    implementation("org.apache.commons:commons-text:1.10.0")
+    implementation("org.flywaydb:flyway-core:9.5.1")
+    implementation("org.mongodb:mongodb-driver-reactivestreams:4.7.2")
     implementation("com.github.openstack4j.core:openstack4j:3.10")
-    implementation("org.postgresql:postgresql:42.3.5")
+    implementation("org.parboiled:parboiled-java:1.4.1")
+    implementation("org.postgresql:postgresql:42.5.0")
     implementation("org.quartz-scheduler:quartz:2.3.2") {
         // we only need org.quartz.CronExpression, so we can exclude all dependencies
         isTransitive = false
     }
-    implementation("org.yaml:snakeyaml:1.30")
+    implementation("org.yaml:snakeyaml:1.33")
 
     implementation(kotlin("reflect"))
     implementation(kotlin("scripting-jvm"))
@@ -87,10 +91,10 @@ dependencies {
     implementation(kotlin("stdlib-jdk8"))
     implementation(kotlin("script-runtime"))
 
-    testImplementation("de.flapdoodle.embed:de.flapdoodle.embed.mongo:3.4.5")
-    testImplementation("io.mockk:mockk:1.12.4")
+    testImplementation("de.flapdoodle.embed:de.flapdoodle.embed.mongo:3.5.1")
+    testImplementation("io.mockk:mockk:1.13.2")
     testImplementation("io.vertx:vertx-junit5:$vertxVersion")
-    testImplementation("org.assertj:assertj-core:3.22.0")
+    testImplementation("org.assertj:assertj-core:3.23.1")
     testImplementation("org.junit.jupiter:junit-jupiter-api:$junitVersion")
     testImplementation("org.junit.jupiter:junit-jupiter-engine:$junitVersion")
     testImplementation("org.junit.jupiter:junit-jupiter-params:$junitVersion")
@@ -108,7 +112,7 @@ dependencies {
 
 
 application {
-    mainClassName = "MainKt"
+    mainClass.set("MainKt")
 
     applicationDefaultJvmArgs = listOf(
         // required to improve performance of Hazelcast
@@ -127,6 +131,19 @@ jacoco {
 }
 
 tasks {
+    fun isNonStable(version: String): Boolean {
+        val stableKeyword = listOf("RELEASE", "FINAL", "GA").any { version.toUpperCase().contains(it) }
+        val regex = "^[0-9,.v-]+(-r)?$".toRegex()
+        val isStable = stableKeyword || regex.matches(version)
+        return !isStable
+    }
+
+    withType<DependencyUpdatesTask> {
+        rejectVersionIf {
+            isNonStable(candidate.version) && !isNonStable(currentVersion)
+        }
+    }
+
     test {
         useJUnitPlatform()
     }

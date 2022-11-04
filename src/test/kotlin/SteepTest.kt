@@ -1,5 +1,6 @@
 import AddressConstants.REMOTE_AGENT_ADDRESS_PREFIX
 import AddressConstants.REMOTE_AGENT_PROCESSCHAINLOGS_SUFFIX
+import agent.AgentRegistry.SelectCandidatesParam
 import agent.LocalAgent
 import agent.RemoteAgentRegistry
 import db.SubmissionRegistry
@@ -7,6 +8,8 @@ import db.SubmissionRegistryFactory
 import helper.CompressedJsonObjectMessageCodec
 import helper.Shell
 import helper.UniqueID
+import helper.hazelcast.ClusterMap
+import helper.hazelcast.DummyClusterMap
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
@@ -59,6 +62,10 @@ class SteepTest {
 
     agentId = UniqueID.next()
 
+    // mock hazelcast instance used by agent registry
+    mockkObject(ClusterMap)
+    every { ClusterMap.create<Any, Any>(any(), any()) } answers { DummyClusterMap(arg(0), arg(1)) }
+
     // mock submission registry
     submissionRegistry = mockk()
     mockkObject(SubmissionRegistryFactory)
@@ -72,7 +79,7 @@ class SteepTest {
     val config = json {
       obj(
           ConfigConstants.AGENT_CAPABILTIIES to array("docker", "gpu"),
-          ConfigConstants.AGENT_BUSY_TIMEOUT to 1L,
+          ConfigConstants.AGENT_BUSY_TIMEOUT to "1s",
           ConfigConstants.AGENT_ID to agentId,
           ConfigConstants.LOGS_PROCESSCHAINS_ENABLED to true,
           ConfigConstants.LOGS_PROCESSCHAINS_PATH to processChainLogPath
@@ -96,8 +103,9 @@ class SteepTest {
     val remoteAgentRegistry = RemoteAgentRegistry(vertx)
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(processChain.requiredCapabilities to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(processChain.requiredCapabilities, 0, 0, 1)
+      ))
       ctx.coVerify {
         val agent = remoteAgentRegistry.tryAllocate(candidates[0].second,
             processChain.id)
@@ -123,8 +131,9 @@ class SteepTest {
     coEvery { anyConstructed<LocalAgent>().execute(processChain) } returns expectedResults
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(processChain.requiredCapabilities to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(processChain.requiredCapabilities, 0, 0, 1)
+      ))
       ctx.coVerify {
         val agent = remoteAgentRegistry.tryAllocate(candidates[0].second,
             processChain.id)
@@ -151,8 +160,9 @@ class SteepTest {
         IOException(errorMessage)
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(processChain.requiredCapabilities to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(processChain.requiredCapabilities, 0, 0, 1)
+      ))
       ctx.coVerify {
         val agent = remoteAgentRegistry.tryAllocate(candidates[0].second,
             processChain.id)
@@ -180,8 +190,9 @@ class SteepTest {
         Shell.ExecutionException(errorMessage, lastOutput, exitCode)
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(processChain.requiredCapabilities to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(processChain.requiredCapabilities, 0, 0, 1)
+      ))
       ctx.coVerify {
         val agent = remoteAgentRegistry.tryAllocate(candidates[0].second,
             processChain.id)
@@ -213,8 +224,9 @@ class SteepTest {
     }
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(processChain.requiredCapabilities to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(processChain.requiredCapabilities, 0, 0, 1)
+      ))
       ctx.coVerify {
         val agent = remoteAgentRegistry.tryAllocate(candidates[0].second,
             processChain.id)
@@ -262,8 +274,9 @@ class SteepTest {
     }
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(processChain.requiredCapabilities to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(processChain.requiredCapabilities, 0, 0, 1)
+      ))
       ctx.coVerify {
         val agent1 = remoteAgentRegistry.tryAllocate(candidates[0].second,
             processChain.id)
@@ -307,8 +320,9 @@ class SteepTest {
     val remoteAgentRegistry = RemoteAgentRegistry(vertx)
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(processChain.requiredCapabilities to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(processChain.requiredCapabilities, 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates).isEmpty()
       }
@@ -325,8 +339,9 @@ class SteepTest {
     val remoteAgentRegistry = RemoteAgentRegistry(vertx)
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(processChain.requiredCapabilities to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(processChain.requiredCapabilities, 0, 0, 1)
+      ))
       ctx.verify {
         assertThat(candidates).containsExactly(Pair(processChain.requiredCapabilities,
             REMOTE_AGENT_ADDRESS_PREFIX + agentId))
@@ -336,28 +351,52 @@ class SteepTest {
   }
 
   /**
-   * Test if the agent selects the best required capabilities by maximum count
-   * of corresponding process chains
+   * Test if the agent selects the best required capabilities by maximum
+   * priority and maximum count of corresponding process chains
    */
   @Test
-  fun bestCapabilitiesByCount(vertx: Vertx, ctx: VertxTestContext) {
+  fun bestCapabilities(vertx: Vertx, ctx: VertxTestContext) {
     val requiredCapabilities1 = setOf("docker")
     val requiredCapabilities2 = setOf("gpu")
     val remoteAgentRegistry = RemoteAgentRegistry(vertx)
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates1 = remoteAgentRegistry.selectCandidates(
-          listOf(requiredCapabilities1 to 1, requiredCapabilities2 to 2))
-      val candidates2 = remoteAgentRegistry.selectCandidates(
-          listOf(requiredCapabilities1 to 2, requiredCapabilities2 to 1))
-      val candidates3 = remoteAgentRegistry.selectCandidates(
-          listOf(requiredCapabilities1 to 1, requiredCapabilities2 to 1))
+      val candidates1 = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(requiredCapabilities1, 0, 0, 1),
+          SelectCandidatesParam(requiredCapabilities2, 0, 0, 2)
+      ))
+      val candidates2 = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(requiredCapabilities1, 0, 0, 2),
+          SelectCandidatesParam(requiredCapabilities2, 0, 0, 1)
+      ))
+      val candidates3 = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(requiredCapabilities1, 0, 0, 1),
+          SelectCandidatesParam(requiredCapabilities2, 0, 0, 1)
+      ))
+      val candidates4 = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(requiredCapabilities1, 9, 10, 1),
+          SelectCandidatesParam(requiredCapabilities2, 0, 9, 2)
+      ))
+      val candidates5 = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(requiredCapabilities1, 0, 0, 2),
+          SelectCandidatesParam(requiredCapabilities2, 10, 100, 1)
+      ))
+      val candidates6 = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(requiredCapabilities1, 10, 100, 1),
+          SelectCandidatesParam(requiredCapabilities2, 10, 100, 2)
+      ))
       ctx.verify {
         assertThat(candidates1).containsExactly(Pair(requiredCapabilities2,
             REMOTE_AGENT_ADDRESS_PREFIX + agentId))
         assertThat(candidates2).containsExactly(Pair(requiredCapabilities1,
             REMOTE_AGENT_ADDRESS_PREFIX + agentId))
         assertThat(candidates3).containsExactly(Pair(requiredCapabilities1,
+            REMOTE_AGENT_ADDRESS_PREFIX + agentId))
+        assertThat(candidates4).containsExactly(Pair(requiredCapabilities1,
+            REMOTE_AGENT_ADDRESS_PREFIX + agentId))
+        assertThat(candidates5).containsExactly(Pair(requiredCapabilities2,
+            REMOTE_AGENT_ADDRESS_PREFIX + agentId))
+        assertThat(candidates6).containsExactly(Pair(requiredCapabilities2,
             REMOTE_AGENT_ADDRESS_PREFIX + agentId))
       }
       ctx.completeNow()
@@ -372,8 +411,9 @@ class SteepTest {
     val remoteAgentRegistry = RemoteAgentRegistry(vertx)
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(emptySet<String>() to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(emptySet(), 0, 0, 1)
+      ))
       ctx.coVerify {
         val agent1 = remoteAgentRegistry.tryAllocate(candidates[0].second,
             UniqueID.next())
@@ -401,8 +441,9 @@ class SteepTest {
     val remoteAgentRegistry = RemoteAgentRegistry(vertx)
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(emptySet<String>() to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(emptySet(), 0, 0, 1)
+      ))
       ctx.coVerify {
         val agent1 = remoteAgentRegistry.tryAllocate(candidates[0].second,
             UniqueID.next())
@@ -431,8 +472,9 @@ class SteepTest {
     val remoteAgentRegistry = RemoteAgentRegistry(vertx)
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(processChain.requiredCapabilities to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(processChain.requiredCapabilities, 0, 0, 1)
+      ))
       ctx.coVerify {
         val agent1 = remoteAgentRegistry.tryAllocate(candidates[0].second,
             processChain.id)
@@ -458,8 +500,9 @@ class SteepTest {
     coEvery { anyConstructed<LocalAgent>().execute(processChain) } returns emptyMap()
 
     CoroutineScope(vertx.dispatcher()).launch {
-      val candidates = remoteAgentRegistry.selectCandidates(
-          listOf(processChain.requiredCapabilities to 1))
+      val candidates = remoteAgentRegistry.selectCandidates(listOf(
+          SelectCandidatesParam(processChain.requiredCapabilities, 0, 0, 1)
+      ))
       ctx.coVerify {
         val agent = remoteAgentRegistry.tryAllocate(candidates[0].second,
             processChain.id)

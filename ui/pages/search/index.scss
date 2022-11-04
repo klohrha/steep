@@ -1,0 +1,98 @@
+@import "css/variables";
+
+.search-container {
+  margin-top: $spacer * 2.6;
+}
+
+.search-input-container, .search-body-container {
+  display: grid;
+  grid-template-columns: minmax(1px, 1fr) 13.5rem;
+  column-gap: $spacer * 2;
+
+  @media (max-width: $xl) {
+    grid-template-columns: 100%;
+  }
+}
+
+.sidebar {
+  margin-top: 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: $spacer * 0.5;
+
+  @media (max-width: $xl) {
+    order: -1;
+    flex-direction: row;
+    margin-top: 0.5rem;
+  }
+
+  .sidebar-expanded {
+    @media (max-width: $xl) {
+      display: none;
+    }
+  }
+
+  .sidebar-dropdown {
+    display: none;
+
+    @media (max-width: $xl) {
+      display: block;
+    }
+  }
+
+  ul {
+    margin: 0;
+    padding: 0.5rem 0;
+    border: 1px solid var(--border-color);
+    border-radius: $border-radius;
+  }
+
+  ul .sidebar-list-item {
+    list-style: none;
+    padding: 0 1rem 0 2rem;
+    height: 2rem;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+    position: relative;
+
+    &:not(.heading) {
+      cursor: pointer;
+
+      &:hover {
+        background-color: var(--gray-100);
+      }
+    }
+
+    .label {
+      margin-bottom: 5px;
+    }
+
+    .active-icon {
+      position: absolute;
+      left: 0.75rem;
+      display: none;
+      margin-bottom: 4px;
+    }
+
+    &.active .active-icon {
+      display: block;
+    }
+
+    &.heading {
+      font-weight: 400;
+      padding-left: 1rem;
+
+      @media (max-width: $xl) {
+        display: none;
+      }
+    }
+  }
+}
+
+.pagination {
+  display: flex;
+  justify-content: center;
+  margin-bottom: $spacer;
+}

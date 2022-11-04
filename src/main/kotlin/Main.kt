@@ -4,6 +4,10 @@ import ch.qos.logback.classic.joran.JoranConfigurator
 import cloud.CloudManager
 import com.hazelcast.cluster.MembershipAdapter
 import com.hazelcast.cluster.MembershipEvent
+import com.hazelcast.config.PartitionGroupConfig
+import com.hazelcast.core.HazelcastInstance
+import com.hazelcast.core.LifecycleEvent
+import com.hazelcast.spi.partitiongroup.PartitionGroupMetaData.PARTITION_GROUP_PLACEMENT
 import db.PluginRegistryFactory
 import db.VMRegistryFactory
 import helper.CompressedJsonObjectMessageCodec
@@ -11,6 +15,7 @@ import helper.JsonUtils
 import helper.LazyJsonObjectMessageCodec
 import helper.UniqueID
 import helper.loadTemplate
+import helper.toDuration
 import io.micrometer.core.instrument.Clock
 import io.micrometer.prometheus.PrometheusConfig
 import io.micrometer.prometheus.PrometheusMeterRegistry
@@ -19,6 +24,7 @@ import io.vertx.core.Vertx.clusteredVertx
 import io.vertx.core.VertxOptions
 import io.vertx.core.json.JsonObject
 import io.vertx.kotlin.core.deploymentOptionsOf
+import io.vertx.kotlin.core.eventbus.deliveryOptionsOf
 import io.vertx.kotlin.core.json.json
 import io.vertx.kotlin.core.json.obj
 import io.vertx.kotlin.coroutines.CoroutineVerticle
@@ -48,6 +54,7 @@ const val ATTR_AGENT_ID = "Agent-ID"
 const val ATTR_AGENT_INSTANCES = "Agent-Instances"
 
 lateinit var globalVertxInstance: io.vertx.core.Vertx
+lateinit var globalHazelcastInstance: HazelcastInstance
 
 suspend fun main() {
   // load configuration
@@ -135,6 +142,20 @@ suspend fun main() {
   hazelcastConfig.memberAttributeConfig.setAttribute(ATTR_AGENT_ID, agentId)
   hazelcastConfig.memberAttributeConfig.setAttribute(ATTR_AGENT_INSTANCES, instances.toString())
 
+  // configure placement groups
+  val placementGroupName = conf.getString(ConfigConstants.CLUSTER_HAZELCAST_PLACEMENT_GROUP_NAME)
+  if (placementGroupName != null) {
+    hazelcastConfig.partitionGroupConfig.isEnabled = true
+    hazelcastConfig.partitionGroupConfig.groupType = PartitionGroupConfig.MemberGroupType.PLACEMENT_AWARE
+    hazelcastConfig.memberAttributeConfig.setAttribute(PARTITION_GROUP_PLACEMENT, placementGroupName)
+  }
+
+  // configure lite member
+  val liteMember = conf.getBoolean(ConfigConstants.CLUSTER_HAZELCAST_LITE_MEMBER, false)
+  if (liteMember) {
+    hazelcastConfig.isLiteMember = true
+  }
+
   // configure event bus
   val mgr = HazelcastClusterManager(hazelcastConfig)
   val options = VertxOptions().setClusterManager(mgr)
@@ -159,6 +180,7 @@ suspend fun main() {
   // start Vert.x
   val vertx = clusteredVertx(options).await()
   globalVertxInstance = vertx
+  globalHazelcastInstance = mgr.hazelcastInstance
 
   // listen to added and left cluster nodes
   // BUGFIX: do not use mgr.nodeListener() or you will override Vert.x's
@@ -186,15 +208,23 @@ suspend fun main() {
               "agentId" to memberAgentId,
               "instances" to memberInstances
           )
-        })
+        }, deliveryOptionsOf(localOnly = true))
       }
     }
   })
 
+  mgr.hazelcastInstance.lifecycleService.addLifecycleListener { lifecycleEvent ->
+    if (lifecycleEvent.state == LifecycleEvent.LifecycleState.MERGED) {
+      vertx.eventBus().publish(AddressConstants.CLUSTER_LIFECYCLE_MERGED, null,
+          deliveryOptionsOf(localOnly = true))
+    }
+  }
+
   // Look for orphaned entries in the remote agent registry from time to time.
   // Such entries may happen if there is a network failure during deregistration
   // of an agent.
-  val lookupOrphansInterval = conf.getLong(ConfigConstants.CLUSTER_LOOKUP_ORPHANS_INTERVAL, 300_000L) // 5 minutes
+  val lookupOrphansInterval = conf.getString(ConfigConstants.CLUSTER_LOOKUP_ORPHANS_INTERVAL, "5m")
+      .toDuration().toMillis()
   val remoteAgentRegistry = RemoteAgentRegistry(vertx)
   CoroutineScope(vertx.dispatcher()).launch {
     while (true) {
@@ -373,25 +403,19 @@ fun configureLogging(conf: JsonObject) {
       <appender name="PROCESSCHAIN" class="ch.qos.logback.classic.sift.SiftingAppender">
         <discriminator class="helper.LoggerNameBasedDiscriminator" />
         <sift>
-            <define name="processChainLogPath" class="helper.ProcessChainLogPathPropertyDefiner">
-                <loggerName>${"$"}{loggerName}</loggerName>
-                <path>${path}</path>
-                <groupByPrefix>${groupByPrefix}</groupByPrefix>
-            </define>
-            <appender name="PROCESSCHAIN-${"$"}{loggerName}" class="ch.qos.logback.core.FileAppender">
-                <file>${"$"}{processChainLogPath}</file>
-                $processChainEncoder
-            </appender>
+          <appender name="PROCESSCHAIN-${"$"}{loggerName}" class="helper.ProcessChainLogFileAppender">
+            <loggerName>${"$"}{loggerName}</loggerName>
+            <path>${path}</path>
+            <groupByPrefix>${groupByPrefix}</groupByPrefix>
+            $processChainEncoder
+          </appender>
         </sift>
       </appender>
       <appender name="PROCESSCHAIN-EVENTBUS" class="ch.qos.logback.classic.sift.SiftingAppender">
         <discriminator class="helper.LoggerNameBasedDiscriminator" />
         <sift>
-          <define name="processChainLogAddress" class="helper.ProcessChainLogAddressPropertyDefiner">
-            <loggerName>${"$"}{loggerName}</loggerName>
-          </define>
           <appender name="PROCESSCHAIN-EVENTBUS-${"$"}{loggerName}" class="helper.EventbusAppender">
-            <address>${"$"}{processChainLogAddress}</address>
+            <loggerName>${"$"}{loggerName}</loggerName>
             $processChainEncoder
           </appender>
         </sift>

@@ -16,7 +16,20 @@ import io.vertx.sqlclient.Row
 import io.vertx.sqlclient.Tuple
 import model.Submission
 import model.processchain.ProcessChain
+import search.DateTerm
+import search.DateTimeRangeTerm
+import search.DateTimeTerm
+import search.Locator
+import search.Operator
+import search.Query
+import search.SearchResult
+import search.StringTerm
+import search.Term
+import search.Type
 import java.time.Instant
+import java.time.OffsetDateTime
+import java.time.format.DateTimeFormatter.ISO_INSTANT
+import java.time.temporal.ChronoUnit
 import java.util.concurrent.TimeUnit
 
 /**
@@ -48,6 +61,8 @@ class PostgreSQLSubmissionRegistry(private val vertx: Vertx, url: String,
     private const val PRIORITY = "priority"
     private const val EXECUTABLES = "executables"
     private const val WORKFLOW = "workflow"
+    private const val NAME = "name"
+    private const val SOURCE = "source"
   }
 
   /**
@@ -72,12 +87,22 @@ class PostgreSQLSubmissionRegistry(private val vertx: Vertx, url: String,
   }
 
   override suspend fun findSubmissionsRaw(status: Submission.Status?, size: Int,
-      offset: Int, order: Int): Collection<JsonObject> {
+      offset: Int, order: Int, excludeWorkflows: Boolean,
+      excludeSources: Boolean): Collection<JsonObject> {
     val asc = if (order >= 0) "ASC" else "DESC"
     val limit = if (size < 0) "ALL" else size.toString()
 
+    val excludesList = mutableListOf<String>()
+    if (excludeWorkflows) {
+      excludesList.add(WORKFLOW)
+    }
+    if (excludeSources) {
+      excludesList.add(SOURCE)
+    }
+    val excludes = excludesList.joinToString(" ", transform = {" #- '{$it}'"})
+
     val statement = StringBuilder()
-    statement.append("SELECT $DATA FROM $SUBMISSIONS ")
+    statement.append("SELECT $DATA$excludes FROM $SUBMISSIONS ")
 
     val params = if (status != null) {
       statement.append("WHERE $DATA->'$STATUS'=$1 ")
@@ -367,12 +392,19 @@ class PostgreSQLSubmissionRegistry(private val vertx: Vertx, url: String,
   }
 
   override suspend fun findProcessChainRequiredCapabilities(
-      status: ProcessChainStatus): List<Collection<String>> {
-    val statement = "SELECT DISTINCT $DATA->'$REQUIRED_CAPABILITIES' " +
-        "FROM $PROCESS_CHAINS WHERE $STATUS=$1"
+      status: ProcessChainStatus): List<Pair<Collection<String>, IntRange>> {
+    val statement = "SELECT $DATA->'$REQUIRED_CAPABILITIES'," +
+        "MIN(($DATA->>'$PRIORITY')::int),MAX(($DATA->>'$PRIORITY')::int) " +
+        "FROM $PROCESS_CHAINS WHERE $STATUS=$1 " +
+        "GROUP BY $DATA->'$REQUIRED_CAPABILITIES'"
     val params = Tuple.of(status.toString())
     val rs = client.preparedQuery(statement).execute(params).await()
-    return rs.map { row -> row.getJsonArray(0).map { it.toString() } }
+    return rs.map { row ->
+      val rcs = row.getJsonArray(0).map { it.toString() }
+      val min = row.getInteger(1)
+      val max = row.getInteger(2)
+      rcs to min..max
+    }
   }
 
   override suspend fun findProcessChainById(processChainId: String): ProcessChain? {
@@ -383,7 +415,8 @@ class PostgreSQLSubmissionRegistry(private val vertx: Vertx, url: String,
   }
 
   override suspend fun countProcessChains(submissionId: String?,
-      status: ProcessChainStatus?, requiredCapabilities: Collection<String>?): Long {
+      status: ProcessChainStatus?, requiredCapabilities: Collection<String>?,
+      minPriority: Int?): Long {
     val statement = StringBuilder()
     statement.append("SELECT COUNT(*) FROM $PROCESS_CHAINS")
 
@@ -400,8 +433,12 @@ class PostgreSQLSubmissionRegistry(private val vertx: Vertx, url: String,
       params.addString(status.toString())
     }
     if (requiredCapabilities != null) {
-      conditions.add("$DATA->'$REQUIRED_CAPABILITIES'=$${pos}")
+      conditions.add("$DATA->'$REQUIRED_CAPABILITIES'=$${pos++}")
       params.addValue(JsonArray(requiredCapabilities.toList()))
+    }
+    if (minPriority != null) {
+      conditions.add("$DATA->'$PRIORITY'>=$${pos}")
+      params.addValue(minPriority)
     }
 
     val rs = if (conditions.isNotEmpty()) {
@@ -433,22 +470,26 @@ class PostgreSQLSubmissionRegistry(private val vertx: Vertx, url: String,
   }
 
   override suspend fun fetchNextProcessChain(currentStatus: ProcessChainStatus,
-      newStatus: ProcessChainStatus, requiredCapabilities: Collection<String>?): ProcessChain? {
-    val (selectStatement, params) = if (requiredCapabilities == null) {
-      "SELECT $ID FROM $PROCESS_CHAINS WHERE $STATUS=$2" to json {
-        Tuple.of(newStatus.toString(), currentStatus.toString())
-      }
-    } else {
-      "SELECT $ID FROM $PROCESS_CHAINS WHERE $STATUS=$2 " +
-          "AND $DATA->'$REQUIRED_CAPABILITIES'=$3" to json {
-        Tuple.of(newStatus.toString(), currentStatus.toString(),
-            JsonArray(requiredCapabilities.toList()))
-      }
+      newStatus: ProcessChainStatus, requiredCapabilities: Collection<String>?,
+      minPriority: Int?): ProcessChain? {
+    val conditions = mutableListOf<String>()
+    val params = Tuple.of(newStatus.toString())
+
+    var pos = 2
+    conditions.add("$STATUS=$${pos++}")
+    params.addString(currentStatus.toString())
+    if (requiredCapabilities != null) {
+      conditions.add("$DATA->'$REQUIRED_CAPABILITIES'=$${pos++}")
+      params.addValue(JsonArray(requiredCapabilities.toList()))
+    }
+    if (minPriority != null) {
+      conditions.add("$DATA->'$PRIORITY'>=$${pos}")
+      params.addValue(minPriority)
     }
 
     val updateStatement = "UPDATE $PROCESS_CHAINS SET $STATUS=$1 " +
         "WHERE $ID = (" +
-          "$selectStatement " +
+          "SELECT $ID FROM $PROCESS_CHAINS WHERE ${conditions.joinToString(" AND ")} " +
           "ORDER BY $DATA->'$PRIORITY' DESC, $SERIAL ASC LIMIT 1 " +
           "FOR UPDATE SKIP LOCKED" + // skip rows being updated concurrently
         ") RETURNING $DATA::varchar"
@@ -483,21 +524,21 @@ class PostgreSQLSubmissionRegistry(private val vertx: Vertx, url: String,
 
   override suspend fun setProcessChainStartTime(processChainId: String, startTime: Instant?) {
     updateColumn(PROCESS_CHAINS, processChainId, START_TIME,
-        JsonUtils.writeValueAsString(startTime))
+        startTime?.let { ISO_INSTANT.format(it) })
   }
 
   override suspend fun getProcessChainStartTime(processChainId: String): Instant? =
       getProcessChainColumn(processChainId, START_TIME) { it.getString(0)?.let { s ->
-        JsonUtils.mapper.readValue(s, Instant::class.java) } }
+        Instant.from(ISO_INSTANT.parse(s)) } }
 
   override suspend fun setProcessChainEndTime(processChainId: String, endTime: Instant?) {
     updateColumn(PROCESS_CHAINS, processChainId, END_TIME,
-        JsonUtils.writeValueAsString(endTime))
+        endTime?.let { ISO_INSTANT.format(it) })
   }
 
   override suspend fun getProcessChainEndTime(processChainId: String): Instant? =
       getProcessChainColumn(processChainId, END_TIME) { it.getString(0)?.let { s ->
-        JsonUtils.mapper.readValue(s, Instant::class.java) } }
+        Instant.from(ISO_INSTANT.parse(s)) } }
 
   override suspend fun getProcessChainSubmissionId(processChainId: String): String {
     return processChainSubmissionIds.getIfPresent(processChainId) ?: run {
@@ -582,4 +623,431 @@ class PostgreSQLSubmissionRegistry(private val vertx: Vertx, url: String,
 
   override suspend fun getProcessChainErrorMessage(processChainId: String): String? =
       getProcessChainColumn(processChainId, ERROR_MESSAGE) { it.getString(0) }
+
+  /**
+   * Escape a string so it can be used in a LIKE expression
+   */
+  private fun escapeLikeExpression(expr: String): String {
+    return expr.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%")
+  }
+
+  /**
+   * Checks if [params] contains [value], and if it does, returns its position.
+   * Otherwise, creates a new position, puts it into [params] and returns it
+   */
+  private fun makeParam(value: Any, params: MutableMap<Any, Int>): Int =
+      params.computeIfAbsent(value) { params.size + 1 }
+
+  /**
+   * Create a LIKE expression that compares [field] to a given [value]. Replaces
+   * [value] with a placeholder and puts the placeholder with its position into
+   * [params].
+   */
+  private fun makeLike(field: String, value: String, params: MutableMap<Any, Int>): String {
+    val like = "%${escapeLikeExpression(value)}%"
+    return "$field ILIKE $${makeParam(like, params)}"
+  }
+
+  /**
+   * Create an expression that compares a timestamp stored in a [field] with
+   * the given [start] time and [endExclusive] time. Puts the placeholder with
+   * its position into [params].
+   */
+  private fun makeTimestampComparison(field: String, start: OffsetDateTime,
+      endExclusive: OffsetDateTime, operator: Operator,
+      params: MutableMap<Any, Int>): String {
+    val f = "($field)::timestamptz"
+    return when (operator) {
+      Operator.LT -> "$f<$" + makeParam(start, params)
+      Operator.LTE -> "$f<$" + makeParam(endExclusive, params)
+      Operator.EQ -> "($f>=$${makeParam(start, params)} AND $f<$${makeParam(endExclusive, params)})"
+      Operator.GTE -> "$f>=$" + makeParam(start, params)
+      Operator.GT -> "$f>=$" + makeParam(endExclusive, params)
+    }
+  }
+
+  /**
+   * Converts a [locator] to a column name or JSONB property name
+   */
+  private fun locatorToField(locator: Locator, type: Type): String? = when (locator) {
+    Locator.ERROR_MESSAGE -> ERROR_MESSAGE
+    Locator.ID -> ID
+    Locator.NAME -> when (type) {
+      Type.WORKFLOW -> "$DATA->>'$NAME'"
+      Type.PROCESS_CHAIN -> null
+    }
+    Locator.REQUIRED_CAPABILITIES -> "$DATA->'$REQUIRED_CAPABILITIES'"
+    Locator.SOURCE -> when (type) {
+      Type.WORKFLOW -> "$DATA->>'$SOURCE'"
+      Type.PROCESS_CHAIN -> null
+    }
+    Locator.STATUS -> when (type) {
+      Type.WORKFLOW -> "$DATA->>'$STATUS'"
+      Type.PROCESS_CHAIN -> STATUS
+    }
+    Locator.START_TIME -> when (type) {
+      Type.WORKFLOW -> "$DATA->>'$START_TIME'"
+      Type.PROCESS_CHAIN -> START_TIME
+    }
+    Locator.END_TIME -> when (type) {
+      Type.WORKFLOW -> "$DATA->>'$END_TIME'"
+      Type.PROCESS_CHAIN -> END_TIME
+    }
+  }
+
+  /**
+   * Converts a locator to a property name in a [SearchResult] object
+   */
+  private fun locatorToResultName(locator: Locator) = when (locator) {
+    Locator.ERROR_MESSAGE -> "errorMessage"
+    Locator.ID -> "id"
+    Locator.NAME -> "name"
+    Locator.REQUIRED_CAPABILITIES -> "requiredCapabilities"
+    Locator.SOURCE -> "source"
+    Locator.STATUS -> "status"
+    Locator.START_TIME -> "startTime"
+    Locator.END_TIME -> "endTime"
+  }
+
+  /**
+   * Creates an SQL WHERE expression from a [locator] and a [term]. Fills
+   * [params] with placeholders.
+   */
+  private fun makeWhere(locator: Locator, term: Term, type: Type,
+      params: MutableMap<Any, Int>): String? {
+    return when (locator) {
+      Locator.ERROR_MESSAGE, Locator.ID -> {
+        when (term) {
+          is StringTerm -> locatorToField(locator, type)?.let { f ->
+            makeLike(f, term.value, params) }
+          else -> null
+        }
+      }
+
+      Locator.STATUS -> {
+        when (term) {
+          is StringTerm -> (when (type) {
+            Type.WORKFLOW -> Submission.Status.values().find {
+              it.name.contains(term.value, true) }?.name
+            Type.PROCESS_CHAIN -> ProcessChainStatus.values().find {
+              it.name.contains(term.value, true) }?.name
+          })?.let { status -> locatorToField(locator, type)?.let { f -> "$f='$status'" } }
+          else -> null
+        }
+      }
+
+      // submission only!
+      Locator.NAME, Locator.SOURCE -> {
+        if (type == Type.WORKFLOW) {
+          when (term) {
+            is StringTerm -> locatorToField(locator, type)?.let { f ->
+              makeLike(f, term.value, params) }
+            else -> null
+          }
+        } else {
+          null
+        }
+      }
+
+      Locator.REQUIRED_CAPABILITIES -> {
+        when (term) {
+          is StringTerm -> makeLike("rcs_to_string(${locatorToField(locator, type)})",
+              term.value, params)
+          else -> null
+        }
+      }
+
+      Locator.START_TIME, Locator.END_TIME -> {
+        locatorToField(locator, type)?.let { f ->
+          when (term) {
+            is DateTerm -> makeTimestampComparison(f,
+                term.value.atStartOfDay(term.timeZone).toOffsetDateTime(),
+                term.value.plusDays(1).atStartOfDay(term.timeZone).toOffsetDateTime(),
+                term.operator, params)
+
+            is DateTimeTerm -> {
+              if (term.withSecondPrecision) {
+                makeTimestampComparison(f,
+                    term.value.truncatedTo(ChronoUnit.SECONDS)
+                        .atZone(term.timeZone).toOffsetDateTime(),
+                    term.value.truncatedTo(ChronoUnit.SECONDS).plusSeconds(1)
+                        .atZone(term.timeZone).toOffsetDateTime(),
+                    term.operator, params)
+              } else {
+                makeTimestampComparison(f,
+                    term.value.truncatedTo(ChronoUnit.MINUTES)
+                        .atZone(term.timeZone).toOffsetDateTime(),
+                    term.value.truncatedTo(ChronoUnit.MINUTES).plusMinutes(1)
+                        .atZone(term.timeZone).toOffsetDateTime(),
+                    term.operator, params)
+              }
+            }
+
+            is DateTimeRangeTerm -> {
+              val start = (if (term.fromInclusiveTime != null) {
+                (if (term.fromWithSecondPrecision) {
+                  term.fromInclusiveDate.atTime(term.fromInclusiveTime)
+                      .truncatedTo(ChronoUnit.SECONDS)
+                } else {
+                  term.fromInclusiveDate.atTime(term.fromInclusiveTime)
+                      .truncatedTo(ChronoUnit.MINUTES)
+                }).atZone(term.timeZone)
+              } else {
+                term.fromInclusiveDate.atStartOfDay(term.timeZone)
+              }).toOffsetDateTime()
+
+              val endExclusive = (if (term.toInclusiveTime != null) {
+                (if (term.toWithSecondPrecision) {
+                  term.toInclusiveDate.atTime(term.toInclusiveTime)
+                      .truncatedTo(ChronoUnit.SECONDS).plusSeconds(1)
+                } else {
+                  term.toInclusiveDate.atTime(term.toInclusiveTime)
+                      .truncatedTo(ChronoUnit.MINUTES).plusMinutes(1)
+                }).atZone(term.timeZone)
+              } else {
+                term.toInclusiveDate.plusDays(1).atStartOfDay(term.timeZone)
+              }).toOffsetDateTime()
+
+              makeTimestampComparison(f, start, endExclusive, Operator.EQ, params)
+            }
+
+            else -> null
+          }
+        }
+      }
+    }
+  }
+
+  override suspend fun search(query: Query, size: Int, offset: Int,
+      order: Int): Collection<SearchResult> {
+    // *************************************************************************
+    //   STOP! DON'T TOUCH THIS CODE UNLESS YOU KNOW EXACTLY WHAT YOU'RE DOING
+    //
+    // The SQL statement generated here has been optimized for performance!
+    // Days worth of effort have been put into this. Several different
+    // strategies including full-text search, word similarity, various indexes
+    // (GIN vs. GIST), and various approaches to the SQL statement have been
+    // evaluated.
+    //
+    // The general idea here is to (a) reduce I/O operations during the query,
+    // (b) to give the PostgreSQL query planner the possibility to make best
+    // use of indexes, and (c) to reduce the number of computations and rows
+    // that need to be sorted during the search.
+    //
+    // Approach:
+    // * The statement is split into three parts. The first two parts are WITH
+    //   queries (CTEs = Common Table Expressions).
+    // * The first CTE fetches the IDs of the rows that match the given
+    //   criteria. It does not fetch any data to reduce the number of buffers
+    //   read (I/O) and to reduce the memory needed for the subsequent sort
+    //   operations. All IDs are put into a union set.
+    // * Note that results for each of the criteria are already limited to
+    //   `maxSubMatches` here. This limits the size of the union set, which
+    //   could otherwise become very large if there are many matching rows.
+    //   Sorting would then take too long and too much memory would be needed.
+    //   However, this might yield incorrect results (see remark below, so
+    //   `maxSubMatches` is a tradeoff here.
+    // * The second CTE takes the union set and counts how often each ID
+    //   appears in it, i.e. how many criteria have matched. The counts are
+    //   then sorted and the result is limited to the `size` argument passed
+    //   to this method.
+    // * The main part of the query then takes the remaining IDs and fetches
+    //   the row data for them. The result needs to be sorted again because
+    //   the join operation might change the order.
+    //
+    // *************************************************************************
+
+    // TODO make configurable
+    // The maximum number of rows to return for each term or query filter
+    // (sorted by SERIAL, descending, so the newest rows will be preferred).
+    // Lower values might yield incorrect results (missing combinations of
+    // terms/filters), higher values might impact performance (especially
+    // if a term matches a large number of rows).
+    // Example for a situation that could lead to incorrect results: A query
+    // contains criteria A and B. The first 1000 rows match criteria A, the
+    // next 1000 rows match both criteria A and B. Normally, you would expect
+    // that the rows matching both criteria should be picked first, but in this
+    // case, this doesn't work. The result set for A is limited to 1000 and
+    // A will not be counted for the next 1000 rows. So, all rows get a rank
+    // of 1 matching criterion. Sorted by rank and serial, the first 1000 rows
+    // (matching only A) will stay at the top.
+    // Solution for this: Either increase `maxSubMatches` or include a filter
+    // in the query that matches B. Filters are like AND-expressions, so with
+    // a filter, the first 1000 rows will actually not be included in the
+    // result at all.
+    val maxSubMatches = 1000
+
+    if (query == Query()) {
+      return emptyList()
+    }
+
+    val asc = if (order >= 0) "ASC" else "DESC"
+    val desc = if (order >= 0) "DESC" else "ASC"
+    val limit = if (size < 0) "ALL" else size.toString()
+
+    // search in all places by default
+    val types = query.types.ifEmpty { Type.values().toSet() }
+    val locators = if (query.terms.isNotEmpty()) {
+      query.locators.ifEmpty { Locator.values().toSet() }
+    } else {
+      emptyList()
+    }
+
+    // create SELECT statements for all types and all conditions
+    val substatements = mutableSetOf<String>()
+    val params = mutableMapOf<Any, Int>()
+    for (type in types) {
+      val table = when (type) {
+        Type.PROCESS_CHAIN -> PROCESS_CHAINS
+        Type.WORKFLOW -> SUBMISSIONS
+      }
+
+      // make a WHERE expression for each filter
+      val whereFilters = mutableSetOf<String>()
+      for (f in query.filters) {
+        makeWhere(f.first, f.second, type, params)?.let { whereFilters.add(it) }
+      }
+
+      // make a SELECT statement for each term
+      var substatementsAdded = false
+      for (term in query.terms) {
+        val whereTerms = mutableSetOf<String>()
+        for (locator in locators) {
+          makeWhere(locator, term, type, params)?.let { whereTerms.add(it) }
+        }
+        if (whereTerms.isNotEmpty()) {
+          val joinedWhereTerms = "(${whereTerms.joinToString(" OR ")})"
+          val joinedWhereFilters = "(${whereFilters.joinToString(" AND ")})"
+          val where = if (whereFilters.isNotEmpty()) {
+            "$joinedWhereTerms AND $joinedWhereFilters"
+          } else {
+            joinedWhereTerms
+          }
+          substatements.add("SELECT $ID,$SERIAL,${type.priority} AS type FROM $table " +
+              "WHERE $where ORDER BY $SERIAL $desc LIMIT $maxSubMatches")
+          substatementsAdded = true
+        }
+      }
+
+      // make a SELECT statement for each filter (but only if there aren't any
+      // substatements for this type yet - i.e. if there are no terms or if the
+      // term/locator combinations did not lead to any substatement)
+      if (!substatementsAdded) {
+        for (where in whereFilters) {
+          substatements.add("SELECT $ID,$SERIAL,${type.priority} AS type FROM $table " +
+              "WHERE $where " +
+              "ORDER BY $SERIAL $desc LIMIT $maxSubMatches")
+        }
+      }
+    }
+
+    if (substatements.isEmpty()) {
+      // nothing to do
+      return emptyList()
+    }
+
+    // determine which columns we need to return (some fields are mandatory
+    // in SearchResults)
+    val columns = mutableSetOf(Locator.ID, Locator.NAME, Locator.STATUS,
+        Locator.REQUIRED_CAPABILITIES, Locator.START_TIME, Locator.END_TIME)
+    for (l in locators) {
+      columns.add(l)
+    }
+    for ((l, _) in query.filters) {
+      columns.add(l)
+    }
+
+    // union all sub-statements, group the results by ID, count the number of
+    // matches per row, and sort by this count
+    val withStatement =
+        "WITH results AS ((${substatements.joinToString(") UNION ALL (")}))," +
+        "ranking AS (SELECT $ID,$SERIAL,type,COUNT(*) AS rank FROM results " +
+        "GROUP BY ($ID,$SERIAL,type) ORDER BY COUNT(*) $desc, type $asc,$SERIAL $desc " +
+        "LIMIT $limit OFFSET $offset)"
+
+    // now that we have the IDs of the rows to return, fetch the actual data
+    val statements = mutableSetOf<String>()
+    for (type in types) {
+      val table = when (type) {
+        Type.PROCESS_CHAIN -> PROCESS_CHAINS
+        Type.WORKFLOW -> SUBMISSIONS
+      }
+      val tcs = columns.map { l ->
+        val f = locatorToField(l, type)
+        val c = if (f == null) "NULL" else "$table.$f"
+        "$c AS \"${locatorToResultName(l)}\""
+      }
+      statements.add("SELECT ${tcs.joinToString(",")},ranking.rank,ranking.serial,ranking.type " +
+          "FROM $table JOIN ranking ON $table.$ID = ranking.$ID")
+    }
+
+    val statement = "$withStatement ${statements.joinToString(" UNION ALL ")} " +
+        "ORDER BY rank $desc,type $asc,$SERIAL $desc"
+
+    val rs = client.preparedQuery(statement).execute(Tuple.from(params.keys.toList())).await()
+    return rs.map { row ->
+      val obj = row.toJson()
+      // remove auxiliary columns
+      obj.remove("rank")
+      obj.remove(SERIAL)
+      JsonUtils.fromJson(obj)
+    }
+  }
+
+  override suspend fun searchCount(query: Query, type: Type, estimate: Boolean): Long {
+    // search in all places by default
+    val locators = if (query.terms.isNotEmpty()) {
+      query.locators.ifEmpty { Locator.values().toSet() }
+    } else {
+      emptyList()
+    }
+
+    val table = when (type) {
+      Type.PROCESS_CHAIN -> PROCESS_CHAINS
+      Type.WORKFLOW -> SUBMISSIONS
+    }
+
+    val params = mutableMapOf<Any, Int>()
+
+    // make a WHERE expression for each filter
+    val whereFilters = mutableSetOf<String>()
+    for (f in query.filters) {
+      makeWhere(f.first, f.second, type, params)?.let { whereFilters.add(it) }
+    }
+
+    // make a WHERE expression for each term/location combination
+    val whereTerms = mutableSetOf<String>()
+    for (term in query.terms) {
+      for (locator in locators) {
+        makeWhere(locator, term, type, params)?.let { whereTerms.add(it) }
+      }
+    }
+
+    if (whereTerms.isEmpty() && whereFilters.isEmpty()) {
+      // nothing to do
+      return 0L
+    }
+
+    val joinedWhereTerms = "(${whereTerms.joinToString(" OR ")})"
+    val joinedWhereFiltersAnd = "(${whereFilters.joinToString(" AND ")})"
+    val joinedWhereFiltersOr = "(${whereFilters.joinToString(" OR ")})"
+    val where = if (whereTerms.isNotEmpty() && whereFilters.isNotEmpty()) {
+      "$joinedWhereTerms AND $joinedWhereFiltersAnd"
+    } else if (whereTerms.isNotEmpty()) {
+      joinedWhereTerms
+    } else {
+      joinedWhereFiltersOr
+    }
+
+    return if (estimate) {
+      val statement = "EXPLAIN (FORMAT JSON, TIMING FALSE) SELECT 1 from $table WHERE $where"
+      val rs = client.preparedQuery(statement).execute(Tuple.from(params.keys.toList())).await()
+      rs?.firstOrNull()?.getJsonArray(0)?.getJsonObject(0)?.getJsonObject("Plan")
+          ?.getLong("Plan Rows") ?: 0L
+    } else {
+      val statement = "SELECT COUNT(*) FROM $table WHERE $where"
+      val rs = client.preparedQuery(statement).execute(Tuple.from(params.keys.toList())).await()
+      rs?.firstOrNull()?.getLong(0) ?: 0L
+    }
+  }
 }

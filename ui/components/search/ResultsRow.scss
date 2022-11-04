@@ -1,0 +1,98 @@
+@import "css/variables";
+
+.results-row {
+  padding: $spacer * 2 0;
+}
+
+.results-row + .results-row {
+  border-top: 1px solid var(--border-color);
+}
+
+.results-row-title {
+  font-weight: 400;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.results-row-icon {
+  margin-right: $spacer * 0.5;
+}
+
+.results-row-info {
+  display: flex;
+  flex-direction: row;
+  gap: 1rem;
+  font-size: $font-size-sm;
+  color: var(--gray-600);
+
+  @media (max-width: $lg) {
+    flex-direction: column;
+    gap: 0;
+  }
+}
+
+.results-highlight {
+  background-color: #fff39e;
+  color: var(--fg-on-light);
+  border-radius: $border-radius * 0.5;
+}
+
+.results-row-error-message, .results-row-source {
+  margin: $spacer * 0.5 0 $spacer * 0.25 0;
+  font-size: $font-size-sm;
+  white-space: pre;
+
+  :global(.hljs), :global(pre) {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    border-radius: $border-radius;
+    margin: 0;
+
+    .results-highlight {
+      color: var(--code-bg);
+    }
+  }
+}
+
+.status, .time, .ongoing-icon {
+  :global(svg) {
+    height: 1em;
+    margin-bottom: 3px;
+
+    @media (max-width: $lg) {
+      width: 1em;
+      margin-right: 0.2em;
+    }
+  }
+}
+
+.ongoing-icon :global(svg) {
+  width: 1em;
+}
+
+.status {
+  &.accepted :global(svg), &.registered :global(svg) {
+    stroke: var(--gray-600);
+  }
+
+  &.running :global(svg) {
+    stroke: var(--gray-600);
+  }
+
+  &.cancelled :global(svg) {
+    stroke: var(--gray-500);
+  }
+
+  &.partial-success :global(svg) {
+    stroke: var(--warning);
+  }
+
+  &.success :global(svg) {
+    stroke: var(--success);
+  }
+
+  &.error :global(svg) {
+    stroke: var(--error);
+  }
+}

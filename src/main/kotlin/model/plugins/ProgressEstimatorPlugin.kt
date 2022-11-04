@@ -1,5 +1,6 @@
 package model.plugins
 
+import com.fasterxml.jackson.annotation.JsonIgnore
 import io.vertx.core.Vertx
 import model.processchain.Executable
 import model.processchain.ProcessChain
@@ -25,6 +26,7 @@ import kotlin.reflect.full.callSuspend
 data class ProgressEstimatorPlugin(
     override val name: String,
     override val scriptFile: String,
+    override val version: String? = null,
 
     /**
      * A list of IDs of the services this estimator plugin supports
@@ -34,6 +36,7 @@ data class ProgressEstimatorPlugin(
     /**
      * The compiled plugin
      */
+    @JsonIgnore
     override val compiledFunction: KFunction<Double?> = throwPluginNeedsCompile()
 ) : Plugin
 

@@ -20,7 +20,6 @@ import helper.bulkWriteAwait
 import helper.countDocumentsAwait
 import helper.deleteAwait
 import helper.deleteManyAwait
-import helper.distinctAwait
 import helper.download
 import helper.findAwait
 import helper.findOneAndUpdateAwait
@@ -42,9 +41,21 @@ import model.Submission
 import model.processchain.Executable
 import model.processchain.ProcessChain
 import org.slf4j.LoggerFactory
+import search.DateTerm
+import search.DateTimeRangeTerm
+import search.DateTimeTerm
+import search.Locator
+import search.Operator
+import search.Query
+import search.SearchResult
+import search.StringTerm
+import search.Term
+import search.Type
 import java.nio.ByteBuffer
 import java.time.Instant
 import java.time.format.DateTimeFormatter.ISO_INSTANT
+import java.time.temporal.ChronoUnit
+import java.util.regex.Pattern
 import io.vertx.ext.mongo.impl.JsonObjectBsonAdapter as wrap
 
 /**
@@ -57,7 +68,7 @@ import io.vertx.ext.mongo.impl.JsonObjectBsonAdapter as wrap
  */
 class MongoDBSubmissionRegistry(private val vertx: Vertx,
     connectionString: String, createIndexes: Boolean = true) :
-    MongoDBRegistry(connectionString), SubmissionRegistry {
+    MongoDBRegistry(vertx, connectionString), SubmissionRegistry {
   companion object {
     private val log = LoggerFactory.getLogger(MongoDBSubmissionRegistry::class.java)
 
@@ -79,6 +90,8 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
     private const val SEQUENCE = "sequence"
     private const val PRIORITY = "priority"
     private const val WORKFLOW = "workflow"
+    private const val NAME = "name"
+    private const val SOURCE = "source"
 
     /**
      * Fields to exclude when querying the `submissions` collection
@@ -89,6 +102,13 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
           SEQUENCE to 0
       )
     }
+    private val SUBMISSION_EXCLUDES_WITH_WORKFLOW = SUBMISSION_EXCLUDES.copy()
+        .put(WORKFLOW, 0)
+    private val SUBMISSION_EXCLUDES_WITH_SOURCE = SUBMISSION_EXCLUDES.copy()
+        .put(SOURCE, 0)
+    private val SUBMISSION_EXCLUDES_WITH_WORKFLOW_AND_SOURCE = SUBMISSION_EXCLUDES.copy()
+        .put(WORKFLOW, 0)
+        .put(SOURCE, 0)
 
     /**
      * Fields to exclude when querying the `processChains` collection
@@ -168,6 +188,14 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
     doc.remove(ID)
     doc.put(SEQUENCE, sequence)
 
+    // store startTime and endTime as BSON timestamps
+    submission.startTime?.let { st ->
+      doc.put(START_TIME, instantToTimestamp(st))
+    }
+    submission.endTime?.let { et ->
+      doc.put(END_TIME, instantToTimestamp(et))
+    }
+
     // Make sure there's always a priority even if it's 0 (we configured Jackson
     // to not serialize 0's by default). Otherwise, we can't sort correctly.
     doc.getJsonObject(WORKFLOW)?.put(PRIORITY, submission.workflow.priority)
@@ -180,6 +208,14 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
     document.remove(SEQUENCE)
     document.put(ID, document.getString(INTERNAL_ID))
     document.remove(INTERNAL_ID)
+
+    // convert BSON timestamps to ISO strings
+    document.getJsonObject(START_TIME)?.let { st ->
+      document.put(START_TIME, ISO_INSTANT.format(timestampToInstant(st)))
+    }
+    document.getJsonObject(END_TIME)?.let { et ->
+      document.put(END_TIME, ISO_INSTANT.format(timestampToInstant(et)))
+    }
 
     // remove priority that we only added for sorting (see [addSubmission])
     if (document.getJsonObject(WORKFLOW)?.getInteger(PRIORITY) == 0) {
@@ -196,7 +232,17 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
   }
 
   override suspend fun findSubmissionsRaw(status: Submission.Status?, size: Int,
-      offset: Int, order: Int): Collection<JsonObject> {
+      offset: Int, order: Int, excludeWorkflows: Boolean,
+      excludeSources: Boolean): Collection<JsonObject> {
+    val excludes = if (excludeWorkflows && excludeSources) {
+      SUBMISSION_EXCLUDES_WITH_WORKFLOW_AND_SOURCE
+    } else if (excludeWorkflows) {
+      SUBMISSION_EXCLUDES_WITH_WORKFLOW
+    } else if (excludeSources) {
+      SUBMISSION_EXCLUDES_WITH_SOURCE
+    } else {
+      SUBMISSION_EXCLUDES
+    }
     val docs = collSubmissions.findAwait(JsonObject().also {
       if (status != null) {
         it.put(STATUS, status.toString())
@@ -205,7 +251,7 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
       obj(
           SEQUENCE to order
       )
-    }, SUBMISSION_EXCLUDES)
+    }, excludes)
     docs.forEach { cleanSubmissionDocument(it) }
     return docs
   }
@@ -291,11 +337,11 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
   }
 
   override suspend fun setSubmissionStartTime(submissionId: String, startTime: Instant) {
-    updateField(collSubmissions, submissionId, START_TIME, startTime)
+    updateField(collSubmissions, submissionId, START_TIME, instantToTimestamp(startTime))
   }
 
   override suspend fun setSubmissionEndTime(submissionId: String, endTime: Instant) {
-    updateField(collSubmissions, submissionId, END_TIME, endTime)
+    updateField(collSubmissions, submissionId, END_TIME, instantToTimestamp(endTime))
   }
 
   override suspend fun setSubmissionStatus(submissionId: String,
@@ -393,25 +439,13 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
 
   override suspend fun deleteSubmissionsFinishedBefore(timestamp: Instant): Collection<String> {
     // find IDs of submissions whose end time is before the given timestamp
-    val submissionIDs1 = collSubmissions.aggregateAwait(listOf(json {
-      obj(
-          "\$project" to obj(
-              END_TIME to obj(
-                  "\$toLong" to obj(
-                      "\$toDate" to "\$$END_TIME"
-                  )
-              )
-          )
-      )
-    }, json {
-      obj(
-          "\$match" to obj(
-              END_TIME to obj(
-                  "\$lt" to timestamp.toEpochMilli()
-              )
-          )
-      )
-    })).map { it.getString(INTERNAL_ID) }
+    val submissionIDs1 = collSubmissions.findAwait(jsonObjectOf(
+        END_TIME to jsonObjectOf(
+            "\$lt" to instantToTimestamp(timestamp)
+        )
+    ), projection = jsonObjectOf(
+        INTERNAL_ID to 1
+    )).map { it.getString(INTERNAL_ID) }
 
     // find IDs of finished submissions that do not have an endTime but
     // whose ID was created before the given timestamp (this will also
@@ -574,13 +608,29 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
         ProcessChainStatus.valueOf(it.getString(STATUS)) })
 
   override suspend fun findProcessChainRequiredCapabilities(
-      status: ProcessChainStatus): List<Collection<String>> {
-    val arrays = collProcessChains.distinctAwait(REQUIRED_CAPABILITIES, json {
-      obj(
-          STATUS to status.toString()
-      )
-    }, String::class.java)
-    return arrays.map { a -> JsonArray(a).map { it.toString() }}
+      status: ProcessChainStatus): List<Pair<Collection<String>, IntRange>> {
+    val result = collProcessChains.aggregateAwait(listOf(
+        jsonObjectOf(
+            "\$match" to jsonObjectOf(
+                STATUS to status.toString()
+            )
+        ),
+        jsonObjectOf(
+            "\$group" to jsonObjectOf(
+                "_id" to "\$$REQUIRED_CAPABILITIES",
+                // priorities are stored negated
+                "minPriority" to jsonObjectOf("\$max" to "\$$PRIORITY"),
+                "maxPriority" to jsonObjectOf("\$min" to "\$$PRIORITY"),
+            )
+        )
+    ))
+    return result.map { r ->
+      val rcs = JsonArray(r.getString("_id")).map { it.toString() }
+      // priorities are stored negated
+      val minPriority = -r.getInteger("minPriority")
+      val maxPriority = -r.getInteger("maxPriority")
+      rcs to minPriority..maxPriority
+    }
   }
 
   override suspend fun findProcessChainById(processChainId: String): ProcessChain? {
@@ -593,7 +643,8 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
   }
 
   override suspend fun countProcessChains(submissionId: String?,
-      status: ProcessChainStatus?, requiredCapabilities: Collection<String>?) =
+      status: ProcessChainStatus?, requiredCapabilities: Collection<String>?,
+      minPriority: Int?) =
       collProcessChains.countDocumentsAwait(JsonObject().also {
         if (submissionId != null) {
           it.put(SUBMISSION_ID, submissionId)
@@ -603,6 +654,10 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
         }
         if (requiredCapabilities != null) {
           it.put(REQUIRED_CAPABILITIES, JsonUtils.writeValueAsString(requiredCapabilities))
+        }
+        if (minPriority != null) {
+          // priorities are stored negated
+          it.put(PRIORITY, jsonObjectOf("\$lte" to -minPriority))
         }
       })
 
@@ -631,32 +686,27 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
   }
 
   override suspend fun fetchNextProcessChain(currentStatus: ProcessChainStatus,
-      newStatus: ProcessChainStatus, requiredCapabilities: Collection<String>?): ProcessChain? {
-    val doc = collProcessChains.findOneAndUpdateAwait(json {
-      if (requiredCapabilities == null) {
-        obj(
-            STATUS to currentStatus.toString()
-        )
-      } else {
-        obj(
-            STATUS to currentStatus.toString(),
-            REQUIRED_CAPABILITIES to JsonUtils.writeValueAsString(requiredCapabilities)
-        )
+      newStatus: ProcessChainStatus, requiredCapabilities: Collection<String>?,
+      minPriority: Int?): ProcessChain? {
+    val doc = collProcessChains.findOneAndUpdateAwait(JsonObject().also {
+      it.put(STATUS, currentStatus.toString())
+      if (requiredCapabilities != null) {
+        it.put(REQUIRED_CAPABILITIES, JsonUtils.writeValueAsString(requiredCapabilities))
       }
-    }, json {
-      obj(
-          "\$set" to obj(
-              STATUS to newStatus.toString()
-          )
+      if (minPriority != null) {
+        // priorities are stored negated
+        it.put(PRIORITY, jsonObjectOf("\$lte" to -minPriority))
+      }
+    }, jsonObjectOf(
+      "\$set" to jsonObjectOf(
+          STATUS to newStatus.toString()
       )
-    }, FindOneAndUpdateOptions()
+    ), FindOneAndUpdateOptions()
         .projection(wrap(PROCESS_CHAIN_EXCLUDES))
-        .sort(wrap(json {
-          obj(
-              PRIORITY to 1,
-              SEQUENCE to 1
-          )
-        })))
+        .sort(wrap(jsonObjectOf(
+            PRIORITY to 1,
+            SEQUENCE to 1
+        ))))
     return doc?.let { readProcessChain(it).first }
   }
 
@@ -677,21 +727,21 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
   }
 
   override suspend fun setProcessChainStartTime(processChainId: String, startTime: Instant?) {
-    updateField(collProcessChains, processChainId, START_TIME, startTime)
+    updateField(collProcessChains, processChainId, START_TIME, instantToTimestamp(startTime))
   }
 
   override suspend fun getProcessChainStartTime(processChainId: String): Instant? =
-      getProcessChainField<String?>(processChainId, START_TIME)?.let {
-        Instant.from(ISO_INSTANT.parse(it))
+      getProcessChainField<Any?>(processChainId, START_TIME)?.let {
+        timestampToInstant(it)
       }
 
   override suspend fun setProcessChainEndTime(processChainId: String, endTime: Instant?) {
-    updateField(collProcessChains, processChainId, END_TIME, endTime)
+    updateField(collProcessChains, processChainId, END_TIME, instantToTimestamp(endTime))
   }
 
   override suspend fun getProcessChainEndTime(processChainId: String): Instant? =
-      getProcessChainField<String?>(processChainId, END_TIME)?.let {
-        Instant.from(ISO_INSTANT.parse(it))
+      getProcessChainField<Any?>(processChainId, END_TIME)?.let {
+        timestampToInstant(it)
       }
 
   override suspend fun getProcessChainSubmissionId(processChainId: String): String =
@@ -836,4 +886,470 @@ class MongoDBSubmissionRegistry(private val vertx: Vertx,
 
   override suspend fun getProcessChainErrorMessage(processChainId: String): String? =
       getProcessChainField(processChainId, ERROR_MESSAGE)
+
+  /**
+   * Create an operator that looks for a [value] in a given [field]. Either
+   * create a $regex operator if [aggregation] is `false` or create an
+   * aggregation operator $regexMatch
+   */
+  private fun makeRegex(field: String, value: String, aggregation: Boolean): JsonObject {
+    return if (aggregation) {
+      jsonObjectOf(
+          "\$regexMatch" to jsonObjectOf(
+              "input" to "\$$field",
+              "regex" to Pattern.quote(value),
+              "options" to "i" // ignore case
+          )
+      )
+    } else {
+      jsonObjectOf(
+          field to jsonObjectOf(
+              "\$regex" to Pattern.quote(value),
+              "\$options" to "i" // ignore case
+          )
+      )
+    }
+  }
+
+  /**
+   * Create an expression that compares a timestamp stored in a [field] with
+   * the given [start] time and [endExclusive] time. Either create an [aggregation]
+   * or a normal comparison expression.
+   */
+  private fun makeTimestampComparison(field: String, start: Instant,
+      endExclusive: Instant, operator: Operator, aggregation: Boolean): JsonObject {
+    return if (aggregation) {
+      val f = "\$$field"
+      when (operator) {
+        Operator.LT -> jsonObjectOf("\$lt" to jsonArrayOf(f, instantToTimestamp(start)))
+        Operator.LTE -> jsonObjectOf("\$lt" to jsonArrayOf(f, instantToTimestamp(endExclusive)))
+        Operator.EQ -> jsonObjectOf("\$and" to jsonArrayOf(
+            jsonObjectOf("\$gte" to jsonArrayOf(f, instantToTimestamp(start))),
+            jsonObjectOf("\$lt" to jsonArrayOf(f, instantToTimestamp(endExclusive)))
+        ))
+        Operator.GTE -> jsonObjectOf("\$gte" to jsonArrayOf(f, instantToTimestamp(start)))
+        Operator.GT -> jsonObjectOf("\$gte" to jsonArrayOf(f, instantToTimestamp(endExclusive)))
+      }
+    } else {
+      jsonObjectOf(field to when (operator) {
+        Operator.LT -> jsonObjectOf("\$lt" to instantToTimestamp(start))
+        Operator.LTE -> jsonObjectOf("\$lt" to instantToTimestamp(endExclusive))
+        Operator.EQ -> jsonObjectOf("\$gte" to instantToTimestamp(start),
+            "\$lt" to instantToTimestamp(endExclusive))
+        Operator.GTE -> jsonObjectOf("\$gte" to instantToTimestamp(start))
+        Operator.GT -> jsonObjectOf("\$gte" to instantToTimestamp(endExclusive))
+      })
+    }
+  }
+
+  /**
+   * Converts a [locator] to a field name
+   */
+  private fun locatorToField(locator: Locator, type: Type,
+      aggregation: Boolean = false): String? = when (locator) {
+    Locator.ERROR_MESSAGE -> ERROR_MESSAGE
+    Locator.ID -> INTERNAL_ID
+    Locator.NAME -> when (type) {
+      Type.WORKFLOW -> NAME
+      Type.PROCESS_CHAIN -> null
+    }
+    Locator.REQUIRED_CAPABILITIES -> if (type == Type.WORKFLOW && aggregation) {
+      // When we determine the document's rank, we need to use aggregation
+      // operators, which cannot handle arrays. So, we use the `joinedRequiredCapabilities`
+      // field here instead, which is a string representation of the array.
+      "joinedRequiredCapabilities"
+    } else {
+      REQUIRED_CAPABILITIES
+    }
+    Locator.SOURCE -> when (type) {
+      Type.WORKFLOW -> SOURCE
+      Type.PROCESS_CHAIN -> null
+    }
+    Locator.STATUS -> STATUS
+    Locator.START_TIME -> START_TIME
+    Locator.END_TIME -> END_TIME
+  }
+
+  /**
+   * Create condition from a [locator] and a [term]. Create an [aggregation]
+   * operator if necessary. Otherwise, create a normal $match condition.
+   */
+  private fun makeCondition(locator: Locator, term: Term, type: Type,
+      aggregation: Boolean): JsonObject? {
+    return when (locator) {
+      Locator.ERROR_MESSAGE, Locator.ID -> {
+        when (term) {
+          is StringTerm -> locatorToField(locator, type)?.let { f ->
+            makeRegex(f, term.value, aggregation) }
+          else -> null
+        }
+      }
+
+      Locator.STATUS -> {
+        when (term) {
+          is StringTerm -> (when (type) {
+            Type.WORKFLOW -> Submission.Status.values().find {
+              it.name.contains(term.value, true) }?.name
+            Type.PROCESS_CHAIN -> ProcessChainStatus.values().find {
+              it.name.contains(term.value, true) }?.name
+          })?.let { status -> locatorToField(locator, type)?.let { f -> jsonObjectOf(f to status) } }
+          else -> null
+        }
+      }
+
+      // submission only!
+      Locator.NAME, Locator.SOURCE -> {
+        if (type == Type.WORKFLOW) {
+          when (term) {
+            is StringTerm -> locatorToField(locator, type)?.let { f ->
+              makeRegex(f, term.value, aggregation) }
+            else -> null
+          }
+        } else {
+          null
+        }
+      }
+
+      Locator.REQUIRED_CAPABILITIES -> {
+        when (term) {
+          is StringTerm -> locatorToField(locator, type, aggregation)?.let { f ->
+            makeRegex(f, term.value, aggregation) }
+          else -> null
+        }
+      }
+
+      Locator.START_TIME, Locator.END_TIME -> {
+        locatorToField(locator, type)?.let { f ->
+          when (term) {
+            is DateTerm -> makeTimestampComparison(f,
+                term.value.atStartOfDay(term.timeZone).toInstant(),
+                term.value.plusDays(1).atStartOfDay(term.timeZone).toInstant(),
+                term.operator, aggregation)
+
+            is DateTimeTerm -> {
+              if (term.withSecondPrecision) {
+                makeTimestampComparison(f,
+                    term.value.truncatedTo(ChronoUnit.SECONDS)
+                        .atZone(term.timeZone).toInstant(),
+                    term.value.truncatedTo(ChronoUnit.SECONDS).plusSeconds(1)
+                        .atZone(term.timeZone).toInstant(),
+                    term.operator, aggregation)
+              } else {
+                makeTimestampComparison(f,
+                    term.value.truncatedTo(ChronoUnit.MINUTES)
+                        .atZone(term.timeZone).toInstant(),
+                    term.value.truncatedTo(ChronoUnit.MINUTES).plusMinutes(1)
+                        .atZone(term.timeZone).toInstant(),
+                    term.operator, aggregation)
+              }
+            }
+
+            is DateTimeRangeTerm -> {
+              val start = (if (term.fromInclusiveTime != null) {
+                (if (term.fromWithSecondPrecision) {
+                  term.fromInclusiveDate.atTime(term.fromInclusiveTime)
+                      .truncatedTo(ChronoUnit.SECONDS)
+                } else {
+                  term.fromInclusiveDate.atTime(term.fromInclusiveTime)
+                      .truncatedTo(ChronoUnit.MINUTES)
+                }).atZone(term.timeZone)
+              } else {
+                term.fromInclusiveDate.atStartOfDay(term.timeZone)
+              }).toInstant()
+
+              val endExclusive = (if (term.toInclusiveTime != null) {
+                (if (term.toWithSecondPrecision) {
+                  term.toInclusiveDate.atTime(term.toInclusiveTime)
+                      .truncatedTo(ChronoUnit.SECONDS).plusSeconds(1)
+                } else {
+                  term.toInclusiveDate.atTime(term.toInclusiveTime)
+                      .truncatedTo(ChronoUnit.MINUTES).plusMinutes(1)
+                }).atZone(term.timeZone)
+              } else {
+                term.toInclusiveDate.plusDays(1).atStartOfDay(term.timeZone)
+              }).toInstant()
+
+              makeTimestampComparison(f, start, endExclusive, Operator.EQ,
+                  aggregation)
+            }
+
+            else -> null
+          }
+        }
+      }
+    }
+  }
+
+  override suspend fun search(query: Query, size: Int, offset: Int,
+      order: Int): Collection<SearchResult> {
+    // TODO if the search becomes to slow, add indexes for all attributes we search
+    // TODO at the moment, performance is quite OK
+
+    if (query == Query() || size == 0) {
+      return emptyList()
+    }
+
+    // search in all places by default
+    val types = query.types.ifEmpty { Type.values().toSet() }
+    val locators = if (query.terms.isNotEmpty()) {
+      query.locators.ifEmpty { Locator.values().toSet() }
+    } else {
+      emptyList()
+    }
+
+    val pipelines = mutableMapOf<Type, MutableList<JsonObject>>()
+    val rankConditions = mutableMapOf<Type, JsonArray>()
+    for (type in types) {
+      // make a condition for each filter
+      val filters = JsonArray()
+      for (f in query.filters) {
+        makeCondition(f.first, f.second, type, false)?.let { filters.add(it) }
+      }
+
+      // make a condition for each term
+      val terms = JsonArray()
+      for (term in query.terms) {
+        val aggregateConditions = JsonArray()
+        for (locator in locators) {
+          makeCondition(locator, term, type, false)?.let { terms.add(it) }
+          makeCondition(locator, term, type, true)?.let { aggregateConditions.add(it) }
+        }
+        if (!aggregateConditions.isEmpty) {
+          rankConditions.computeIfAbsent(type) { JsonArray() }.add(jsonObjectOf(
+              "\$cond" to jsonArrayOf(
+                  jsonObjectOf(
+                      "\$or" to aggregateConditions
+                  ),
+                  1, 0
+              )
+          ))
+        }
+      }
+
+      val match = jsonObjectOf()
+      if (!terms.isEmpty) {
+        match.put("\$or", terms)
+      }
+      if (!filters.isEmpty) {
+        match.put("\$and", filters)
+      }
+
+      if (!match.isEmpty) {
+        val matchStage = jsonObjectOf(
+            "\$match" to match
+        )
+        pipelines.computeIfAbsent(type) { mutableListOf() }.add(matchStage)
+      }
+    }
+
+    if (pipelines.isEmpty() || pipelines.all { it.value.isEmpty() }) {
+      // nothing to do
+      return emptyList()
+    }
+
+    // TODO If the search is too slow for very large databases, we could do
+    // TODO something like the PostgreSQLSubmissionRegistry does and limit
+    // TODO the results to the first 1000 newest documents. For the time begin
+    // TODO search speed is actually quite OK
+    // for (type in types) {
+    //   val pl = pipelines[type] ?: continue
+    //   pl.add(jsonObjectOf(
+    //       "\$sort" to jsonObjectOf(
+    //           SEQUENCE to -order
+    //       )
+    //   ))
+    //   pl.add(jsonObjectOf(
+    //       "\$limit" to 1000
+    //   ))
+    // }
+
+    if (locators.contains(Locator.REQUIRED_CAPABILITIES)) {
+      // add 'joinedRequiredCapabilities' field that we can use to calculate 'rank'
+      // this field contains a string representation of the `requiredCapabilities`
+      // array with values separated by a non-breaking space
+      pipelines[Type.WORKFLOW]?.add(jsonObjectOf(
+          "\$addFields" to jsonObjectOf(
+              "joinedRequiredCapabilities" to jsonObjectOf(
+                  "\$reduce" to jsonObjectOf(
+                      "input" to "\$$REQUIRED_CAPABILITIES",
+                      "initialValue" to "",
+                      "in" to jsonObjectOf(
+                          "\$concat" to jsonArrayOf("\$\$value", "\$\$this", "\u00a0")
+                      )
+                  )
+              )
+          )
+      ))
+    }
+
+    // determine rank for each match
+    val rankConditionCounts = mutableMapOf<Type, Int>()
+    for ((type, conds) in rankConditions) {
+      val pl = pipelines[type] ?: continue
+      var count = 0
+      val fieldsToAdd = JsonObject()
+      for (cond in conds) {
+        fieldsToAdd.put("rank_$count", cond)
+        count++
+      }
+      if (!fieldsToAdd.isEmpty) {
+        pl.add(jsonObjectOf(
+            "\$addFields" to fieldsToAdd
+        ))
+      }
+      rankConditionCounts[type] = count
+    }
+
+    // determine which columns we need to return (some fields are mandatory
+    // in SearchResults)
+    val columns = mutableSetOf(Locator.ID, Locator.NAME, Locator.STATUS,
+        Locator.REQUIRED_CAPABILITIES, Locator.START_TIME, Locator.END_TIME)
+    for (l in locators) {
+      columns.add(l)
+    }
+    for ((l, _) in query.filters) {
+      columns.add(l)
+    }
+
+    for (type in types) {
+      val pl = pipelines[type] ?: continue
+
+      val projectedFields = JsonObject()
+      for (c in columns) {
+        val f = locatorToField(c, type)
+        if (f != null) {
+          projectedFields.put(f, 1)
+        }
+      }
+      projectedFields.put(SEQUENCE, 1)
+      val rankConditionCount = rankConditionCounts[type] ?: 0
+      projectedFields.put("rank", jsonObjectOf(
+          "\$add" to JsonArray((0 until rankConditionCount).map { "\$rank_$it"})
+      ))
+      val project = jsonObjectOf(
+          "\$project" to projectedFields
+      )
+
+      val addTypeSubmissions = jsonObjectOf(
+          "\$addFields" to jsonObjectOf(
+              "type" to type.priority
+          )
+      )
+
+      pl.add(project)
+      pl.add(addTypeSubmissions)
+    }
+
+    val pipeline = mutableListOf<JsonObject>()
+    val collection = if (pipelines[Type.WORKFLOW]?.isNotEmpty() == true &&
+        pipelines[Type.PROCESS_CHAIN]?.isNotEmpty() == true) {
+      pipeline.addAll(pipelines[Type.WORKFLOW]!!)
+      pipeline.add(jsonObjectOf(
+          "\$unionWith" to jsonObjectOf(
+              "coll" to COLL_PROCESS_CHAINS,
+              "pipeline" to pipelines[Type.PROCESS_CHAIN]!!
+          )
+      ))
+      collSubmissions
+    } else if (pipelines[Type.WORKFLOW]?.isNotEmpty() == true) {
+      pipeline.addAll(pipelines[Type.WORKFLOW]!!)
+      collSubmissions
+    } else {
+      pipeline.addAll(pipelines[Type.PROCESS_CHAIN]!!)
+      collProcessChains
+    }
+
+    // sort results
+    pipeline.add(jsonObjectOf(
+        "\$sort" to jsonObjectOf(
+            "rank" to -order,
+            "type" to order,
+            SEQUENCE to -order
+        )
+    ))
+
+    if (offset > 0) {
+      pipeline.add(jsonObjectOf(
+          "\$skip" to offset
+      ))
+    }
+
+    if (size > 0) {
+      pipeline.add(jsonObjectOf(
+          "\$limit" to size
+      ))
+    }
+
+    return collection.aggregateAwait(pipeline).map { r ->
+      if (r.getValue(REQUIRED_CAPABILITIES) is String) {
+        // required capabilities are stored as strings in process chain documents
+        r.put(REQUIRED_CAPABILITIES, JsonArray(r.getString(REQUIRED_CAPABILITIES)))
+      }
+
+      // rename internal ID
+      r.put(ID, r.getString(INTERNAL_ID))
+      r.remove(INTERNAL_ID)
+
+      // remove auxiliary fields
+      r.remove("rank")
+      r.remove(SEQUENCE)
+
+      // convert BSON timestamps to ISO strings
+      r.getJsonObject(START_TIME)?.let { st ->
+        r.put(START_TIME, ISO_INSTANT.format(timestampToInstant(st)))
+      }
+      r.getJsonObject(END_TIME)?.let { et ->
+        r.put(END_TIME, ISO_INSTANT.format(timestampToInstant(et)))
+      }
+
+      JsonUtils.fromJson(r)
+    }
+  }
+
+  override suspend fun searchCount(query: Query, type: Type, estimate: Boolean): Long {
+    if (query == Query()) {
+      return 0L
+    }
+
+    // search in all places by default
+    val locators = if (query.terms.isNotEmpty()) {
+      query.locators.ifEmpty { Locator.values().toSet() }
+    } else {
+      emptyList()
+    }
+
+    // make a condition for each filter
+    val filters = JsonArray()
+    for (f in query.filters) {
+      makeCondition(f.first, f.second, type, false)?.let { filters.add(it) }
+    }
+
+    // make a condition for each term
+    val terms = JsonArray()
+    for (term in query.terms) {
+      for (locator in locators) {
+        makeCondition(locator, term, type, false)?.let { terms.add(it) }
+      }
+    }
+
+    val match = jsonObjectOf()
+    if (!terms.isEmpty) {
+      match.put("\$or", terms)
+    }
+    if (!filters.isEmpty) {
+      match.put("\$and", filters)
+    }
+
+    if (match.isEmpty) {
+      // nothing to do
+      return 0L
+    }
+
+    val coll = when (type) {
+      Type.WORKFLOW -> collSubmissions
+      Type.PROCESS_CHAIN -> collProcessChains
+    }
+
+    return coll.countDocumentsAwait(match)
+  }
 }

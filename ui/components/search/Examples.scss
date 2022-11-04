@@ -1,0 +1,25 @@
+@import "css/variables";
+
+.examples {
+  margin-top: 1rem;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+
+  @media (max-width: $md) {
+    display: flex;
+    flex-direction: column;
+  }
+}
+
+.example {
+  margin-top: $spacer * 2;
+
+  &.combined {
+    grid-column-end: span 2;
+  }
+}
+
+.example-title {
+  font-size: 0.85rem;
+  font-weight: 400;
+}

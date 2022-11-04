@@ -2,7 +2,7 @@ import ListContext from "../lib/ListContext"
 import fetcher from "../lib/json-fetcher"
 
 import {
-  AGENT_ADDRESS_PREFIX,
+  CLUSTER_NODE_LEFT,
   AGENT_ADDED,
   AGENT_LEFT,
   AGENT_BUSY,
@@ -11,14 +11,33 @@ import {
 
 const ADD_MESSAGES = {
   [AGENT_ADDED]: (body) => {
-    let id = body.substring(AGENT_ADDRESS_PREFIX.length)
-    return fetcher(`${process.env.baseUrl}/agents/${id}`).then(agent => [agent])
+    return fetcher(`${process.env.baseUrl}/agents/${body}`).then(agent => [agent])
   }
 }
 
 const UPDATE_MESSAGES = {
+  [AGENT_ADDED]: (body) => ({
+    id: body,
+    left: false, // make agent visible again if it's already in the list
+    processChainId: undefined,
+    stateChangedTime: new Date()
+  }),
+  [CLUSTER_NODE_LEFT]: (body) => {
+    let agentId = body.agentId
+    let instances = body.instances || 1
+    let r = []
+    for (let i = 1; i <= instances; ++i) {
+      let id = i === 1 ? agentId : `${agentId}[${i}]`
+      r.push({
+        id,
+        left: true,
+        stateChangedTime: new Date()
+      })
+    }
+    return r
+  },
   [AGENT_LEFT]: (body) => ({
-    id: body.substring(AGENT_ADDRESS_PREFIX.length),
+    id: body,
     left: true,
     processChainId: undefined,
     stateChangedTime: new Date()

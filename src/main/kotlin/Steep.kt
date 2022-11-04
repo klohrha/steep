@@ -1,15 +1,23 @@
+import AddressConstants.CLUSTER_LIFECYCLE_MERGED
+import AddressConstants.CLUSTER_NODE_LEFT
 import AddressConstants.REMOTE_AGENT_ADDRESS_PREFIX
 import AddressConstants.REMOTE_AGENT_BUSY
 import AddressConstants.REMOTE_AGENT_IDLE
 import AddressConstants.REMOTE_AGENT_PROCESSCHAINLOGS_SUFFIX
+import agent.AgentRegistry.SelectCandidatesParam
 import agent.LocalAgent
 import agent.RemoteAgentRegistry
+import com.fasterxml.jackson.module.kotlin.convertValue
 import db.SubmissionRegistry
 import helper.CompressedJsonObjectMessageCodec
 import helper.JsonUtils
 import helper.Shell
+import helper.debounce
+import helper.toDuration
+import helper.withRetry
 import io.vertx.core.buffer.Buffer
 import io.vertx.core.eventbus.Message
+import io.vertx.core.impl.ConcurrentHashSet
 import io.vertx.core.impl.NoStackTraceThrowable
 import io.vertx.core.json.JsonArray
 import io.vertx.core.json.JsonObject
@@ -19,14 +27,17 @@ import io.vertx.kotlin.core.file.openOptionsOf
 import io.vertx.kotlin.core.json.array
 import io.vertx.kotlin.core.json.get
 import io.vertx.kotlin.core.json.json
+import io.vertx.kotlin.core.json.jsonObjectOf
 import io.vertx.kotlin.core.json.obj
 import io.vertx.kotlin.coroutines.CoroutineVerticle
 import io.vertx.kotlin.coroutines.await
 import io.vertx.kotlin.coroutines.toReceiveChannel
 import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import model.processchain.ProcessChain
+import model.retry.RetryPolicy
 import org.slf4j.LoggerFactory
 import java.nio.file.NoSuchFileException
 import java.nio.file.Paths
@@ -34,6 +45,10 @@ import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.CancellationException
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
+import kotlin.system.exitProcess
+import kotlin.time.toKotlinDuration
 
 /**
  * Steep's main API entry point
@@ -42,6 +57,7 @@ import java.util.concurrent.Executors
 class Steep : CoroutineVerticle() {
   companion object {
     private val log = LoggerFactory.getLogger(Steep::class.java)
+    private val ALL_LOCAL_AGENT_IDS = ConcurrentHashSet<String>()
   }
 
   private data class BusyMarker(val timestamp: Instant,
@@ -53,6 +69,7 @@ class Steep : CoroutineVerticle() {
   private lateinit var remoteAgentRegistry: RemoteAgentRegistry
   private lateinit var capabilities: Set<String>
   private var busy: BusyMarker? = null
+  private val isExecuting = AtomicBoolean(false)
   private lateinit var busyTimeout: Duration
   private var lastProcessChainSequence = -1L
   private lateinit var autoShutdownTimeout: Duration
@@ -72,10 +89,10 @@ class Steep : CoroutineVerticle() {
   private var lastExecuteTime = Instant.now()
 
   override suspend fun start() {
-    busyTimeout = Duration.ofSeconds(config.getLong(
-        ConfigConstants.AGENT_BUSY_TIMEOUT, 60L))
-    autoShutdownTimeout = Duration.ofMinutes(config.getLong(
-        ConfigConstants.AGENT_AUTO_SHUTDOWN_TIMEOUT, 0))
+    busyTimeout = config.getString(
+        ConfigConstants.AGENT_BUSY_TIMEOUT, "1m").toDuration()
+    autoShutdownTimeout = config.getString(
+        ConfigConstants.AGENT_AUTO_SHUTDOWN_TIMEOUT, "0m").toDuration()
     agentId = config.getString(ConfigConstants.AGENT_ID) ?:
         throw IllegalStateException("Missing configuration item " +
             "`${ConfigConstants.AGENT_ID}'")
@@ -93,15 +110,38 @@ class Steep : CoroutineVerticle() {
     remoteAgentRegistry = RemoteAgentRegistry(vertx)
     remoteAgentRegistry.register(agentId)
 
+    // safeguard to make sure we're always in the agent registry even if data
+    // in the cluster is lost
+    val reregister = debounce(vertx) {
+      remoteAgentRegistry.register(agentId)
+    }
+    vertx.eventBus().localConsumer<String>(CLUSTER_NODE_LEFT) {
+      reregister()
+    }
+    vertx.eventBus().localConsumer<Unit>(CLUSTER_LIFECYCLE_MERGED) {
+      reregister()
+    }
+
     // register consumer to provide process chain logs if we are the primary agent
     if (isPrimary) {
       vertx.eventBus().consumer(address + REMOTE_AGENT_PROCESSCHAINLOGS_SUFFIX,
           this::onProcessChainLogs)
     }
 
+    ALL_LOCAL_AGENT_IDS.add(agentId)
+
     // setup automatic shutdown
-    if (autoShutdownTimeout.toMinutes() > 0) {
-      vertx.setPeriodic(1000L * 30L) { checkAutoShutdown() }
+    if (isPrimary && autoShutdownTimeout.toMillis() > 0) {
+      val interval = if (autoShutdownTimeout.toMinutes() > 0) {
+        1000L * 30L
+      } else {
+        5000L
+      }
+      vertx.setPeriodic(interval) {
+        launch {
+          checkAllAutoShutdown()
+        }
+      }
     }
 
     if (capabilities.isEmpty()) {
@@ -114,19 +154,47 @@ class Steep : CoroutineVerticle() {
 
   override suspend fun stop() {
     log.info("Stopping remote agent $agentId ...")
+    ALL_LOCAL_AGENT_IDS.remove(agentId)
     remoteAgentRegistry.deregister(agentId)
   }
 
   /**
-   * Checks if the agent has been idle for more than [autoShutdownTimeout]
-   * minutes and, if so, shuts down the Vert.x instance.
+   * Check if all local agents have been idle for more than [autoShutdownTimeout]
+   * and, if so, shut down the process.
    */
-  private fun checkAutoShutdown() {
-    if (!isBusy() && lastExecuteTime.isBefore(Instant.now().minus(autoShutdownTimeout))) {
-      log.info("Agent has been idle for more than ${autoShutdownTimeout.toMinutes()} " +
-          "minutes. Shutting down ...")
-      vertx.close()
+  private suspend fun checkAllAutoShutdown() {
+    val allAgentsCanShutdown = ALL_LOCAL_AGENT_IDS.all { id ->
+      if (id == agentId) {
+        canAutoShutdown()
+      } else {
+        vertx.eventBus().request<Boolean>(REMOTE_AGENT_ADDRESS_PREFIX + id, jsonObjectOf(
+            "action" to "canAutoShutdown"
+        ), deliveryOptionsOf(localOnly = true)).await().body()
+      }
     }
+    if (allAgentsCanShutdown) {
+      log.info("All local agents have been idle for more than " +
+          "${autoShutdownTimeout.toKotlinDuration()}. Shutting down ...")
+
+      // Use `exitProcess` instead of `vertx.close()` so all shutdown hooks
+      // can be executed. Run it in a background thread to allow this verticle
+      // to be undeployed.
+      thread { exitProcess(0) }
+    }
+  }
+
+  /**
+   * Check if the agent has been idle for more than [autoShutdownTimeout]
+   */
+  private fun canAutoShutdown(): Boolean {
+    return !isBusy() && lastExecuteTime.isBefore(Instant.now().minus(autoShutdownTimeout))
+  }
+
+  /**
+   * Check if the agent has been idle for more than [autoShutdownTimeout]
+   */
+  private fun onCanAutoShutdown(msg: Message<JsonObject>) {
+    msg.reply(canAutoShutdown())
   }
 
   /**
@@ -142,6 +210,7 @@ class Steep : CoroutineVerticle() {
         "allocate" -> onAgentAllocate(msg)
         "deallocate" -> onAgentDeallocate(msg)
         "process" -> onProcessChain(msg)
+        "canAutoShutdown" -> onCanAutoShutdown(msg)
         else -> throw NoStackTraceThrowable("Unknown action `$action'")
       }
     } catch (e: Throwable) {
@@ -310,7 +379,9 @@ class Steep : CoroutineVerticle() {
                   "data" to buf.toString()
               )
             }
-            vertx.eventBus().request<Unit>(replyAddress, chunk).await()
+            vertx.eventBus().request<Unit>(replyAddress, chunk, deliveryOptionsOf(
+                codecName = CompressedJsonObjectMessageCodec.NAME
+            )).await()
           }
 
           // send end marker
@@ -326,6 +397,10 @@ class Steep : CoroutineVerticle() {
    * Returns `true` if the agent is busy
    */
   private fun isBusy(): Boolean {
+    if (isExecuting.get()) {
+      // a process chain is currently being executed
+      return true
+    }
     val timedOut = busy?.timestamp?.isBefore(Instant.now().minus(busyTimeout)) ?: return false
     if (timedOut) {
       markBusy(null)
@@ -402,34 +477,40 @@ class Steep : CoroutineVerticle() {
       -1
     } else {
       // Select requiredCapabilities that best match our own capabilities.
-      // Prefer capability sets with a high number of process chains.
-      val arr = msg.body().getJsonArray("requiredCapabilities")
-      var max = -1L
-      var best = -1
+      // Prefer capability sets with the highest priority and the highest
+      // number of process chains.
+      val params = JsonUtils.mapper.convertValue<List<SelectCandidatesParam>>(
+          msg.body().getJsonArray("params"))
 
-      for ((i, rcs) in arr.withIndex()) {
-        val rcsObj = rcs as JsonObject
-        val rcsArr = rcsObj.getJsonArray("capabilities")
-        val rcsCount = rcsObj.getLong("processChainCount")
+      // calculate number of matching capabilities for each param and filter
+      // out those that require capabilities we don't have
+      val matching = params.mapIndexedNotNull { i, p ->
         var ok = true
-        var count = 0L
-
-        for (rc in rcsArr) {
+        var n = 0
+        for (rc in p.requiredCapabilities) {
           if (capabilities.contains(rc)) {
-            count += rcsCount
+            n++
           } else {
             ok = false
             break
           }
         }
-
-        if (ok && count > max) {
-          max = count
-          best = i
+        if (!ok) {
+          null
+        } else {
+          (i to p) to n
         }
       }
 
-      best
+      // sort by number of matched capabilities, maxPriority, and number of process chains
+      val sorted = matching.sortedWith(
+          compareByDescending<Pair<Pair<Int, SelectCandidatesParam>, Int>> { it.second }
+              .thenByDescending { it.first.second.maxPriority }
+              .thenByDescending { it.first.second.count }
+      )
+
+      // get the index of the best one
+      sorted.firstOrNull()?.first?.first ?: -1
     }
 
     val reply = json {
@@ -537,6 +618,7 @@ class Steep : CoroutineVerticle() {
 
       // run the local agent and return its results
       launch {
+        isExecuting.set(true)
         try {
           log.info("Executing process chain ${processChain.id} ...")
           val answer = executeProcessChain(processChain)
@@ -545,27 +627,28 @@ class Steep : CoroutineVerticle() {
           val replyAddresses = busy?.replyAddresses ?: listOf(replyAddress)
           markBusy(BusyMarker(Instant.now(), null))
 
-          // send answer to all reply addresses
-          for (address in replyAddresses) {
-            for (tries in 4 downTo 0) {
-              try {
-                log.info("Sending results of process chain ${processChain.id} " +
-                    "to $address ...")
-                vertx.eventBus().request<Any>(address, answer, deliveryOptionsOf(
-                    codecName = CompressedJsonObjectMessageCodec.NAME
-                )).await()
-                break
-              } catch (t: Throwable) {
-                log.error("Error sending results of process chain " +
-                    "${processChain.id} to peer. Waiting 1 second. " +
-                    "$tries retries remaining.", t)
-                delay(1000)
+          // send answer to all reply addresses (in parallel)
+          replyAddresses.map { address ->
+            async {
+              withRetry(RetryPolicy(5, delay = 1000L, exponentialBackoff = 2)) {
+                try {
+                  log.info("Sending results of process chain ${processChain.id} " +
+                      "to $address ...")
+                  vertx.eventBus().request<Any>(address, answer, deliveryOptionsOf(
+                      codecName = CompressedJsonObjectMessageCodec.NAME
+                  )).await()
+                } catch (t: Throwable) {
+                  log.error("Error sending results of process chain " +
+                      "${processChain.id} to $address")
+                  throw t
+                }
               }
             }
-          }
+          }.awaitAll()
         } finally {
           lastExecuteTime = Instant.now()
           vertx.cancelTimer(busyTimer)
+          isExecuting.set(false)
         }
       }
 

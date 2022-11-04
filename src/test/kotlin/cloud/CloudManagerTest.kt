@@ -11,6 +11,9 @@ import db.VMRegistryFactory
 import helper.LazyJsonObjectMessageCodec
 import helper.UniqueID
 import helper.YamlUtils
+import helper.hazelcast.ClusterMap
+import helper.hazelcast.DummyClusterMap
+import helper.toDuration
 import io.mockk.Runs
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -39,6 +42,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import model.cloud.VM
+import model.retry.RetryPolicy
+import model.setup.CreationPolicy
 import model.setup.Setup
 import model.setup.Volume
 import org.assertj.core.api.Assertions.assertThat
@@ -61,8 +66,8 @@ class CloudManagerTest {
     private const val MY_OLD_VM = "MY_OLD_VM"
     private const val MY_OLD_VOLUME = "MY_OLD_VOLUME"
     private const val CREATED_BY_TAG = "CloudManagerTest"
-    private const val SYNC_INTERVAL = 2
-    private const val KEEP_ALIVE_INTERVAL = 1
+    private const val SYNC_INTERVAL = "2s"
+    private const val KEEP_ALIVE_INTERVAL = "1s"
     private const val AZ01 = "az-01"
     private const val AZ02 = "az-02"
     private const val DUMMY_TEXT = "THIS IS A DUMMY TEXT"
@@ -73,6 +78,10 @@ class CloudManagerTest {
 
   @BeforeEach
   fun setUp(vertx: Vertx) {
+    // mock hazelcast instance used by agent registry
+    mockkObject(ClusterMap)
+    every { ClusterMap.create<Any, Any>(any(), any()) } answers { DummyClusterMap(arg(0), arg(1)) }
+
     // mock cloud client
     client = mockk()
     mockkObject(CloudClientFactory)
@@ -139,9 +148,16 @@ class CloudManagerTest {
 
     coEvery { client.getImageID(setup.imageName) } returns setup.imageName
     if (mockCreateResources) {
+      val metadataSlot = slot<Map<String, String>>()
       coEvery { client.createBlockDevice(setup.blockDeviceSizeGb,
           setup.blockDeviceVolumeType, setup.imageName, true,
-          setup.availabilityZone, metadata) } answers { UniqueID.next() }
+          setup.availabilityZone, capture(metadataSlot)) } answers {
+        ctx.verify {
+          assertThat(metadataSlot.captured).containsAllEntriesOf(metadata)
+          assertThat(metadataSlot.captured).containsKey("VM-External-Id")
+        }
+        UniqueID.next()
+      }
       coEvery { client.createVM(any(), setup.flavor, any(), setup.availabilityZone,
           metadata) } answers { UniqueID.next() }
     }
@@ -178,8 +194,7 @@ class CloudManagerTest {
         ctx.verify {
           assertThat(agentId).isNotEmpty()
         }
-        vertx.eventBus().publish(REMOTE_AGENT_ADDED,
-            REMOTE_AGENT_ADDRESS_PREFIX + agentId)
+        vertx.eventBus().publish(REMOTE_AGENT_ADDED, agentId)
       }
     }
 
@@ -323,6 +338,7 @@ class CloudManagerTest {
   inner class Create {
     private lateinit var testSetup: Setup
     private lateinit var testSetupLarge: Setup
+    private lateinit var testSetupWithAlternative: Setup
     private lateinit var testSetupAlternative: Setup
     private lateinit var testSetupTwo: Setup
     private lateinit var testSetupWithVolumes: Setup
@@ -352,10 +368,14 @@ class CloudManagerTest {
       testSetupLarge = Setup("testLarge", "myFlavor", "myImage", AZ01, 500000,
           "SSD", 0, 4, provisioningScripts = listOf(testSh.absolutePath),
           providedCapabilities = listOf("test2"))
+      testSetupWithAlternative = Setup("testWithAlternative", "myflavor", "myImage", AZ01, 500000,
+          null, 0, 1, provisioningScripts = listOf(testSh.absolutePath),
+          providedCapabilities = listOf("test3", "alternative"),
+          creation = CreationPolicy(retries = RetryPolicy(2)))
       testSetupAlternative = Setup("testAlternative", "myAlternativeFlavor",
           "myImage", AZ02, 500000, null, 0, 1,
           provisioningScripts = listOf(testSh.absolutePath),
-          providedCapabilities = listOf("test3", "foo"))
+          providedCapabilities = listOf("test3", "alternative"))
       testSetupTwo = Setup("testTwo", "myflavorTwo", "myImageTwo", AZ01, 500000,
           null, 0, 3, maxCreateConcurrent = 2,
           provisioningScripts = listOf(testSh.absolutePath),
@@ -366,7 +386,8 @@ class CloudManagerTest {
             testVolume1, testVolume2, testVolume3))
 
       deployCloudManager(tempDir, listOf(testSetup, testSetupLarge,
-          testSetupAlternative, testSetupTwo, testSetupWithVolumes), vertx, ctx)
+          testSetupWithAlternative, testSetupAlternative, testSetupTwo,
+          testSetupWithVolumes), vertx, ctx)
     }
 
     /**
@@ -476,31 +497,33 @@ class CloudManagerTest {
     fun createVMAlternativeSetup(vertx: Vertx, ctx: VertxTestContext) {
       CoroutineScope(vertx.dispatcher()).launch {
         // let the first setup throw an exception and the second succeed
-        coEvery { client.createVM(any(), testSetup.flavor, any(),
-            testSetup.availabilityZone, any()) } throws IllegalStateException()
+        coEvery { client.createVM(any(), testSetupWithAlternative.flavor, any(),
+            testSetupWithAlternative.availabilityZone, any()) } throws IllegalStateException()
         coEvery { client.createVM(any(), testSetupAlternative.flavor, any(),
             testSetupAlternative.availabilityZone, any()) } answers { UniqueID.next() }
 
         // mock additional methods
         coEvery { client.destroyBlockDevice(any()) } just Runs
-        coEvery { client.createBlockDevice(testSetup.blockDeviceSizeGb,
-            testSetup.blockDeviceVolumeType, testSetup.imageName, true,
-            testSetup.availabilityZone, any()) } answers { UniqueID.next() }
+        coEvery { client.createBlockDevice(testSetupWithAlternative.blockDeviceSizeGb,
+            testSetupWithAlternative.blockDeviceVolumeType,
+            testSetupWithAlternative.imageName, true,
+            testSetupWithAlternative.availabilityZone, any()) } answers { UniqueID.next() }
         coEvery { client.createBlockDevice(testSetupAlternative.blockDeviceSizeGb,
             testSetupAlternative.blockDeviceVolumeType, testSetupAlternative.imageName, true,
             testSetupAlternative.availabilityZone, any()) } answers { UniqueID.next() }
 
-        doCreateOnDemand(testSetup, vertx, ctx, 1, false, listOf("foo"))
+        doCreateOnDemand(testSetupWithAlternative, vertx, ctx, 1, false)
 
         ctx.coVerify {
-          coVerify(exactly = 2) {
-            client.getImageID(testSetup.imageName)
+          coVerify(exactly = 3) {
+            client.getImageID(testSetupWithAlternative.imageName)
           }
-          coVerify(exactly = 1) {
-            client.createBlockDevice(testSetup.blockDeviceSizeGb, null,
-                testSetup.imageName, true, testSetup.availabilityZone, any())
-            client.createVM(any(), testSetup.flavor, any(),
-                testSetup.availabilityZone, any())
+          coVerify(exactly = 2) {
+            client.createBlockDevice(testSetupWithAlternative.blockDeviceSizeGb, null,
+                testSetupWithAlternative.imageName, true,
+                testSetupWithAlternative.availabilityZone, any())
+            client.createVM(any(), testSetupWithAlternative.flavor, any(),
+                testSetupWithAlternative.availabilityZone, any())
           }
           coVerify(exactly = 1) {
             client.createBlockDevice(testSetupAlternative.blockDeviceSizeGb,
@@ -511,6 +534,8 @@ class CloudManagerTest {
           }
           coVerify(exactly = 1) {
             client.getIPAddress(any())
+          }
+          coVerify(exactly = 2) {
             client.destroyBlockDevice(any())
           }
         }
@@ -746,7 +771,7 @@ class CloudManagerTest {
         val address = REMOTE_AGENT_ADDRESS_PREFIX + agentId
 
         // count keep-alive messages
-        vertx.eventBus().consumer<JsonObject>(address) { msg ->
+        vertx.eventBus().consumer(address) { msg ->
           val jsonObj: JsonObject = msg.body()
           val action = jsonObj.getString("action")
           if (action == "keepAlive") {
@@ -758,7 +783,7 @@ class CloudManagerTest {
         agentIds.add(agentId)
 
         // send REMOTE_AGENT_ADDED when the VM has been provisioned
-        vertx.eventBus().publish(REMOTE_AGENT_ADDED, address)
+        vertx.eventBus().publish(REMOTE_AGENT_ADDED, agentId)
       }
 
       deployCloudManager(tempDir, listOf(testSetupMin), vertx, ctx)
@@ -771,7 +796,7 @@ class CloudManagerTest {
     fun tryCreateMin(vertx: Vertx, ctx: VertxTestContext) {
       CoroutineScope(vertx.dispatcher()).launch {
         // give the CloudManager enough time to call sync() at least two times
-        delay(SYNC_INTERVAL * 2 * 1000L)
+        delay(SYNC_INTERVAL.toDuration().toMillis() * 2)
 
         ctx.coVerify {
           coVerify(exactly = 2) {
@@ -876,7 +901,7 @@ class CloudManagerTest {
         val address = REMOTE_AGENT_ADDRESS_PREFIX + agentId
 
         // count keep-alive messages
-        vertx.eventBus().consumer<JsonObject>(address) { msg ->
+        vertx.eventBus().consumer(address) { msg ->
           val jsonObj: JsonObject = msg.body()
           val action = jsonObj.getString("action")
           if (action == "keepAlive") {
@@ -888,7 +913,7 @@ class CloudManagerTest {
         agentIds.add(agentId)
 
         // send REMOTE_AGENT_ADDED when the VM has been provisioned
-        vertx.eventBus().publish(REMOTE_AGENT_ADDED, address)
+        vertx.eventBus().publish(REMOTE_AGENT_ADDED, agentId)
       }
 
       deployCloudManager(tempDir, listOf(testSetup, testSetup2, testSetup3),
@@ -920,7 +945,7 @@ class CloudManagerTest {
     fun tryCreateMin(vertx: Vertx, ctx: VertxTestContext) {
       CoroutineScope(vertx.dispatcher()).launch {
         // give the CloudManager enough time to call sync() at least once
-        delay(SYNC_INTERVAL * 2 * 1000L)
+        delay(SYNC_INTERVAL.toDuration().toMillis() * 2)
 
         ctx.coVerify {
           coVerify(exactly = 2) {
