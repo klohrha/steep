@@ -14,6 +14,7 @@ import com.fkorotkov.kubernetes.extensions.*
 import io.fabric8.kubernetes.api.model.IntOrString
 import io.fabric8.kubernetes.api.model.Pod
 import io.fabric8.kubernetes.api.model.PodList
+import io.fabric8.kubernetes.api.model.apps.Deployment
 import io.fabric8.kubernetes.client.ConfigBuilder
 import io.fabric8.kubernetes.client.DefaultKubernetesClient
 import io.fabric8.kubernetes.client.KubernetesClientBuilder
@@ -85,10 +86,9 @@ class FaasRuntime(config: JsonObject) : OtherRuntime() {
             .withConfig(config)
             .build()
 
-
         // try out hello world
         val target = System.getenv("TARGET") ?: "World"
-        val port = System.getenv("PORT") ?: "8080"
+        val port = System.getenv("PORT") ?: "8082"
         embeddedServer(Netty, port.toInt()) {
             routing {
                 get("/") {
@@ -105,9 +105,10 @@ class FaasRuntime(config: JsonObject) : OtherRuntime() {
             }
         }).createOrReplace()
 
+
         client.pods().resource(newPod {
             metadata {
-                name = "test-pod-" + id
+                name = "helloworld-kotlin"
                 spec {
                     volumes = listOf(
                         newVolume {
@@ -121,7 +122,6 @@ class FaasRuntime(config: JsonObject) : OtherRuntime() {
                         newContainer {
                             name = "custom-container"
                             image = executable.path
-                            args = processedArgs
                             volumeMounts = listOf(
                                 newVolumeMount {
                                     mountPath = "/C/Users/hanna/Documents/uni/22_sose/thesis/steep"
@@ -140,7 +140,7 @@ class FaasRuntime(config: JsonObject) : OtherRuntime() {
             }
         }).createOrReplace()
 
-        client.pods().inNamespace("default").withField("metadata.name", "test-pod-" + id).waitUntilCondition({pod -> println(pod.status.phase); pod.status.phase.equals("Succeeded")}, 3, TimeUnit.MINUTES)
+        //client.pods().inNamespace("default").withField("metadata.name", "test-pod-" + id).waitUntilCondition({pod -> println(pod.status.phase); pod.status.phase.equals("Succeeded")}, 3, TimeUnit.MINUTES)
         println("Success")
 
         } catch (e: InterruptedException) {

@@ -33,7 +33,6 @@
   description: sleeps for the given amount of seconds
   path: sleep
   runtime: other
-
   parameters:
     - id: seconds
       name: seconds to sleep
@@ -59,7 +58,7 @@
 - id: faas_hello_world
   name: FaaS hello world
   description: Runs a kotlin hello world inside a service
-  path: hello-world
+  path: "docker.io/klohrha/helloworld-kotlin"
   runtime: faas
   parameters: []
 

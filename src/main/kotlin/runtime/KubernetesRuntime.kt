@@ -22,7 +22,7 @@ import io.fabric8.kubernetes.client.dsl.PodResource
 import java.util.concurrent.TimeUnit
 
 /**
- * Runs executables as Docker containers. Uses the executable's path as the
+ * Runs executables as kubernetes pods. Uses the executable's path as the
  * Docker image name.
  * @author Michel Kraemer
  */

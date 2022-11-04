@@ -25,6 +25,7 @@ val junitVersion by extra("5.8.2")
 val testcontainersVersion by extra("1.16.3")
 val kubernetes_dsl_version by extra("3.2.0")
 val kubernetes_client_version by extra("6.0.0")
+val kotlin_hello_version by extra("1.3.1")
 
 repositories {
     mavenCentral()
@@ -100,7 +101,11 @@ dependencies {
     //kubernetes kotlin library
     implementation("com.github.fkorotkov:k8s-kotlin-dsl:$kubernetes_dsl_version")
     implementation("io.fabric8:kubernetes-client:$kubernetes_client_version")
+
+    //kotlin hello world
+    implementation("io.ktor:ktor-server-netty:$kotlin_hello_version")
 }
+
 
 application {
     mainClassName = "MainKt"
