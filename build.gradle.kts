@@ -108,6 +108,10 @@ dependencies {
 
     //kotlin hello world
     implementation("io.ktor:ktor-server-netty:$kotlin_hello_version")
+
+    implementation("org.bouncycastle:bcprov-jdk15on:1.51")
+    implementation("org.bouncycastle:bcpkix-jdk15on:1.57")
+
 }
 
 

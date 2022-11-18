@@ -388,14 +388,14 @@ class LocalAgent(private val vertx: Vertx, val dispatcher: CoroutineDispatcher,
 
     return so.chunked(100).map { w ->
       Executable(
-        path = "cmd",
+        path = "mkdir",
         serviceId = "mkdir",
         arguments = listOf(
             Argument(
-                label = "/c",
-                variable = ArgumentVariable(UniqueID.next(), "mkdir"),
+                label = "-p",
+                variable = ArgumentVariable(UniqueID.next(), "true"),
                 type = Argument.Type.INPUT,
-                dataType = Argument.DATA_TYPE_STRING
+                dataType = Argument.DATA_TYPE_BOOLEAN
             ),
 
         ) + w.map { o ->

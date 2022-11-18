@@ -70,7 +70,7 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
         val id = UniqueID.next()
 
         val config = ConfigBuilder()
-            .withMasterUrl("127.0.0.1:8081")
+            .withMasterUrl("127.0.0.1:8087")
             .withNamespace("default")
             .withTrustCerts(true)
             .build()
@@ -105,7 +105,7 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
                             args = processedArgs
                             volumeMounts = listOf(
                                 newVolumeMount {
-                                    mountPath = "/C/Users/hanna/Documents/uni/22_sose/thesis/steep"
+                                    mountPath = "/home/hklohr/Documents/thesis/steep"
                                     name = "task-pv-storage"
                                 }
                             )
@@ -128,7 +128,7 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
             try {
                 //TODO
                 Shell.execute(listOf("kubectl", "kill", containerName), outputCollector)
-                Shell.execute(listOf("minikube", "stop"), outputCollector)
+                ///Shell.execute(listOf("minikube", "stop"), outputCollector)
             } catch (t: Throwable) {
                 // ignore
             }
