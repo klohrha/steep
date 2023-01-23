@@ -110,7 +110,7 @@
 - id: panorama-tiler-faas
   name: panorama-tiler-faas
   description: Generates panorama tiles to a directory
-  path: "geocode.igd.fraunhofer.de:4567/telekom/panorama-tiler:v3.4.2"
+  path: "http://127.0.0.1:8080/function/panorama-tiler"
   runtime: faas
   parameters:
     - id: input_directory
@@ -119,17 +119,40 @@
       type: input
       cardinality: 1..1
       dataType: directory
+      label: input
     - id: output_directory
       name: Output directory
       description: An output directory
       type: output
       cardinality: 1..1
       dataType: file
+      label: output
+    - id: endpoint
+      name: s3 endpoint
+      description: s3 endpoint for cloud storage
+      type: input
+      cardinality: 1..1
+      dataType: string
+      label: s3endpoint
+    - id: profile
+      name: s3 profile
+      description: s3 profile for cloud storage
+      type: input
+      cardinality: 1..1
+      dataType: string
+      label: s3profile
+    - id: bucket
+      name: s3 bucket
+      description: s3 bucket for cloud storage
+      type: input
+      cardinality: 1..1
+      dataType: string
+      label: s3bucket
 
 - id: anonymizer
   name: anonymizer
   description: Anonymizes images from a directory and saves them to a directory
-  path: "geocode.igd.fraunhofer.de:4567/hklohr/anonymizer"
+  path: "geocode.igd.fraunhofer.de:4567/hklohr/anonymizer:nos3"
   runtime: docker
   parameters:
     - id: input_directory
@@ -150,7 +173,7 @@
 - id: anonymizer-kubernetes
   name: anonymizer-kubernetes
   description: Anonymizes images from a directory and saves them to a directory
-  path: "geocode.igd.fraunhofer.de:4567/hklohr/anonymizer"
+  path: "geocode.igd.fraunhofer.de:4567/hklohr/anonymizer:nos3"
   runtime: kubernetes
   parameters:
     - id: input_directory
@@ -167,6 +190,48 @@
       cardinality: 1..1
       dataType: file
       label: -o
+
+- id: anonymizer-faas
+  name: anonymizer-faas
+  description: Anonymizes images from a directory and saves them to a directory
+  path: "http://127.0.0.1:8080/function/dockerfunc"
+  runtime: faas
+  parameters:
+    - id: input_directory
+      name: Input directory
+      description: A directory containing panoramas to convert
+      type: input
+      cardinality: 1..1
+      dataType: directory
+      label: input
+    - id: output_directory
+      name: Output directory
+      description: An output directory
+      type: output
+      cardinality: 1..1
+      dataType: file
+      label: output
+    - id: endpoint
+      name: s3 endpoint
+      description: s3 endpoint for cloud storage
+      type: input
+      cardinality: 1..1
+      dataType: string
+      label: s3endpoint
+    - id: profile
+      name: s3 profile
+      description: s3 profile for cloud storage
+      type: input
+      cardinality: 1..1
+      dataType: string
+      label: s3profile
+    - id: bucket
+      name: s3 bucket
+      description: s3 bucket for cloud storage
+      type: input
+      cardinality: 1..1
+      dataType: string
+      label: s3bucket
 
 - id: docker_sleep
   name: Docker sleep

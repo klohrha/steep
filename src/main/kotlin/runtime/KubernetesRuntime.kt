@@ -27,24 +27,10 @@ import java.util.concurrent.TimeUnit
  * @author Michel Kraemer
  */
 class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
-    private val additionalDockerEnvironment: List<String> = config.getJsonArray(
-        ConfigConstants.RUNTIMES_DOCKER_ENV, JsonArray()).map { it.toString() }
-    private val additionalDockerVolumes: List<String> = config.getJsonArray(
-        ConfigConstants.RUNTIMES_DOCKER_VOLUMES, JsonArray()).map { it.toString() }
-    private val tmpPath: String = config.getString(ConfigConstants.TMP_PATH) ?:
-    throw IllegalStateException("Missing configuration item `${ConfigConstants.TMP_PATH}'")
 
     override fun execute(executable: Executable, outputCollector: OutputCollector) {
-        val additionalEnvironment = additionalDockerEnvironment.map {
-            Argument(id = UniqueID.next(),
-                label = "-e", variable = ArgumentVariable(UniqueID.next(), it),
-                type = Argument.Type.INPUT)
-        }
-        val additionalVolumes = additionalDockerVolumes.map {
-            Argument(id = UniqueID.next(),
-                label = "-v", variable = ArgumentVariable(UniqueID.next(), it),
-                type = Argument.Type.INPUT)
-        }
+        val start = System.currentTimeMillis()
+        println("Starting kubernetes execution at: " + start)
 
         // keep container name if already defined
         val existingContainerName = executable.runtimeArgs.firstOrNull { it.label == "--name" }?.variable?.value
@@ -120,8 +106,14 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
                 }
             }
         }).createOrReplace()
-
-        client.pods().inNamespace("default").withField("metadata.name", "test-pod-" + id).waitUntilCondition({pod -> println(pod.status.phase); pod.status.phase.equals("Succeeded")}, 3, TimeUnit.MINUTES)
+        var newPod = 0
+        client.pods().inNamespace("default").withField("metadata.name", "test-pod-" + id).waitUntilCondition({
+            pod -> println(pod.status.phase);
+            if (pod.status.phase.equals("Running") && newPod == 0) {
+                println("Pod has started after " + (System.currentTimeMillis()-start))
+                newPod++
+            };
+            pod.status.phase.equals("Succeeded")}, 15, TimeUnit.MINUTES)
         println("Success")
 
         } catch (e: InterruptedException) {
@@ -134,5 +126,6 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
             }
             throw e
         }
+        println(executable.id+ " finished kubernetes execution after: " + (System.currentTimeMillis()-start))
     }
 }

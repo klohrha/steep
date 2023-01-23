@@ -1,5 +1,6 @@
 package runtime
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.fkorotkov.kubernetes.*
 import helper.OutputCollector
 import helper.Shell
@@ -28,6 +29,10 @@ import io.ktor.response.*
 import io.ktor.routing.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 
 /**
  * Runs executables as Docker containers. Uses the executable's path as the
@@ -35,110 +40,45 @@ import io.ktor.server.netty.*
  * @author Michel Kraemer
  */
 class FaasRuntime(config: JsonObject) : OtherRuntime() {
-    private val additionalDockerEnvironment: List<String> = config.getJsonArray(
-        ConfigConstants.RUNTIMES_DOCKER_ENV, JsonArray()).map { it.toString() }
-    private val additionalDockerVolumes: List<String> = config.getJsonArray(
-        ConfigConstants.RUNTIMES_DOCKER_VOLUMES, JsonArray()).map { it.toString() }
+
     private val tmpPath: String = config.getString(ConfigConstants.TMP_PATH) ?:
     throw IllegalStateException("Missing configuration item `${ConfigConstants.TMP_PATH}'")
-
     override fun execute(executable: Executable, outputCollector: OutputCollector) {
-        val additionalEnvironment = additionalDockerEnvironment.map {
-            Argument(id = UniqueID.next(),
-                label = "-e", variable = ArgumentVariable(UniqueID.next(), it),
-                type = Argument.Type.INPUT)
-        }
-        val additionalVolumes = additionalDockerVolumes.map {
-            Argument(id = UniqueID.next(),
-                label = "-v", variable = ArgumentVariable(UniqueID.next(), it),
-                type = Argument.Type.INPUT)
-        }
+        val start = System.currentTimeMillis()
+        println("Starting faas execution at: " + start)
 
         // keep container name if already defined
         val existingContainerName = executable.runtimeArgs.firstOrNull { it.label == "--name" }?.variable?.value
         val containerName = existingContainerName ?: "steep-${executable.id}-${executable.serviceId}-${UniqueID.next()}"
             .lowercase().replace("""[^a-z0-9]""".toRegex(), "-")
-        val containerNameArgument = if (existingContainerName == null) {
-            listOf(Argument(id = UniqueID.next(),
-                label = "--name", variable = ArgumentVariable("dockerContainerName", containerName),
-                type = Argument.Type.INPUT))
-        } else {
-            emptyList()
-        }
 
-        val processedArgs = mutableListOf<String>()
+        val values = mutableMapOf<String?, String>()
         for (arg in executable.arguments) {
-            if (arg.label != null) {
-                processedArgs.add(arg.label)
-                println("label" + arg.label)
-            }
-            processedArgs.add(arg.variable.value)
+            // temp workaround for s3 writing
+            //if (arg.label == "output") {
+             //   values[arg.label] = "/tmp"
+            //} else {
+                values[arg.label] = arg.variable.value
+            //}
         }
 
         val id = UniqueID.next()
 
-        val config = ConfigBuilder()
-            .withMasterUrl("127.0.0.1:8081")
-            .withNamespace("default")
-            .withTrustCerts(true)
-            .build()
-        val client = KubernetesClientBuilder()
-            .withConfig(config)
-            .build()
-
-        // try out hello world
-        val target = System.getenv("TARGET") ?: "World"
-        val port = System.getenv("PORT") ?: "8082"
-        embeddedServer(Netty, port.toInt()) {
-            routing {
-                get("/") {
-                    call.respondText("Hello $target!\n", ContentType.Text.Html)
-                }
-            }
-        }.start(wait = true)
-
         try {
+           // print(values)
+        //val values = mapOf("input" to "/images", "output" to "/tmp", "s3endpoint" to "http://192.168.178.79:9000/", "s3profile" to "default", "s3bucket" to "myfirstbucket")
 
-        client.namespaces().resource(newNamespace {
-            metadata {
-                name = "default"
-            }
-        }).createOrReplace()
+        val objectMapper = ObjectMapper()
+        val requestBody: String = objectMapper
+                .writeValueAsString(values)
 
-
-        client.pods().resource(newPod {
-            metadata {
-                name = "helloworld-kotlin"
-                spec {
-                    volumes = listOf(
-                        newVolume {
-                            name = "task-pv-storage"
-                            persistentVolumeClaim = newPersistentVolumeClaimVolumeSource{
-                                claimName = "task-pv-claim"
-                            }
-                        }
-                    )
-                    containers = listOf(
-                        newContainer {
-                            name = "custom-container"
-                            image = executable.path
-                            volumeMounts = listOf(
-                                newVolumeMount {
-                                    mountPath = "/C/Users/hanna/Documents/uni/22_sose/thesis/steep"
-                                    name = "task-pv-storage"
-                                }
-                            )
-                        }
-                    )
-                    imagePullSecrets = listOf(
-                         newLocalObjectReference {
-                            name = "regcred"
-                        }
-                    )
-                    restartPolicy = "OnFailure"
-                }
-            }
-        }).createOrReplace()
+        val client = HttpClient.newBuilder().build();
+        val request = HttpRequest.newBuilder()
+                .uri(URI.create(executable.path))
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                .build()
+        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+        println(response.body())
 
         //client.pods().inNamespace("default").withField("metadata.name", "test-pod-" + id).waitUntilCondition({pod -> println(pod.status.phase); pod.status.phase.equals("Succeeded")}, 3, TimeUnit.MINUTES)
         println("Success")
@@ -152,5 +92,6 @@ class FaasRuntime(config: JsonObject) : OtherRuntime() {
             }
             throw e
         }
+        println(executable.id + " finished faas execution after: " + (System.currentTimeMillis()-start))
     }
 }

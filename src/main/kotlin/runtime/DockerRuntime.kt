@@ -23,6 +23,9 @@ class DockerRuntime(config: JsonObject) : OtherRuntime() {
       throw IllegalStateException("Missing configuration item `${ConfigConstants.TMP_PATH}'")
 
   override fun execute(executable: Executable, outputCollector: OutputCollector) {
+    val start = System.currentTimeMillis()
+    println("Starting docker execution at: " + start)
+
     val additionalEnvironment = additionalDockerEnvironment.map {
       Argument(id = UniqueID.next(),
           label = "-e", variable = ArgumentVariable(UniqueID.next(), it),
@@ -71,5 +74,7 @@ class DockerRuntime(config: JsonObject) : OtherRuntime() {
       }
       throw e
     }
+    println(executable.id + " finished docker execution after: " + (System.currentTimeMillis()-start))
+
   }
 }
