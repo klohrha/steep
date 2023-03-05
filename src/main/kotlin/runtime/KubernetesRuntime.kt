@@ -113,7 +113,7 @@ class KubernetesRuntime(config: JsonObject) : OtherRuntime() {
                 println("Pod has started after " + (System.currentTimeMillis()-start))
                 newPod++
             };
-            pod.status.phase.equals("Succeeded")}, 15, TimeUnit.MINUTES)
+            pod.status.phase.equals("Succeeded")}, 30, TimeUnit.MINUTES)
         println("Success")
 
         } catch (e: InterruptedException) {
